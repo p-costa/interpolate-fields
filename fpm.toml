@@ -1,0 +1,13 @@
+name = "interpolate-fields"
+version = "0.1.0"
+license = "MIT"
+author = "Pedro Costa"
+maintainer = "p.simoes.costa@gmail.com"
+copyright = "Copyright 2021, Pedro Costa"
+[build]
+auto-executables = true
+auto-tests = false
+auto-examples = false
+external-modules = "mpi_f08"
+[install]
+library = false
