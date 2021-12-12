@@ -4,8 +4,6 @@
 # Disable the default rules
 MAKEFLAGS += --no-builtin-rules --no-builtin-variables
 
-.SUFFIXES:	.c .o .d .f90 .f .F90
-
 # Project name
 NAME := interpit
 
