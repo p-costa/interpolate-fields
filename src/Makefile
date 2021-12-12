@@ -62,8 +62,8 @@ $(TEST_EXE): %.exe: %.f90.o $(LIB)
 	$(LD) -o $@ $^
 
 $(EXE): $(OBJS)
-	$(FC) $(FFLAGS) $^ -o $(EXE)
 	mkdir -p $(EXEDIR)/data
+	$(FC) $(FFLAGS) $^ -o $(EXE)
 
 # Create object files from Fortran source
 $(OBJS) $(TEST_OBJS): %.o: % | %.d
