@@ -9,6 +9,7 @@ NAME := interpit
 
 TARGET := $(NAME)
 
+PWD=$(shell pwd)
 ROOTDIR := $(PWD)/..
 SRCDIR := $(ROOTDIR)/src
 APPDIR := $(ROOTDIR)/app
