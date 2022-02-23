@@ -41,6 +41,10 @@
     !
     character(len=*), parameter             :: input_file  = 'data/fld_i.bin', &
                                                output_file = 'data/fld_o.bin'
+#ifdef _NON_UNIFORM_Z
+    character(len=*), parameter             :: input_grid_file  = 'data/grid_i.bin', &
+                                               output_grid_file = 'data/grid_o.bin'
+#endif
     !
     ! local problem sizes
     !
@@ -161,24 +165,64 @@
       call set_bc(cbcvel(1,3,3),1,3,1,.false.,bcvel(1,3,3),dli(3),wi)
       call set_bc(cbcpre(1,3  ),1,3,1,.true. ,bcpre(1,3  ),dli(3),pi)
     end if
+#ifdef _NON_UNIFORM_Z
+    block
+      real(rp), allocatable, dimension(:) :: bufi,bufo,zfi_g,zfo_g,zci_g,zco_g, &
+                                                       zfi  ,zfo  ,zci  ,zco
+      integer :: k,kk,rlen
+      !
+      allocate(bufi(0:ni(3)+1),bufo(0:no(3)+1))
+      allocate(zci_g(0:ni(3)+1),zfi_g(0:ni(3)+1), &
+               zco_g(0:no(3)+1),zfo_g(0:no(3)+1))
+      inquire(iolength=rlen) 1._rp
+      open(99,file=input_grid_file ,access='direct',recl=4*ni(3)*rlen)
+      read(99,rec=1) bufi(0:ni(3)+1),bufi(0:ni(3)+1),zci_g(0:ni(3)+1),zfi_g(0:ni(3)+1)
+      close(99)
+      open(99,file=output_grid_file,access='direct',recl=4*no(3)*rlen)
+      read(99,rec=1) bufo(0:no(3)+1),bufo(0:no(3)+1),zco_g(0:no(3)+1),zfo_g(0:no(3)+1)
+      close(99)
+      allocate(zci_g(0:nni(3)+1),zfi_g(0:nni(3)+1), &
+               zco_g(0:nno(3)+1),zfo_g(0:nno(3)+1))
+      do kk=lo_i(3)-1,hi_i(3)+1
+        k = kk-(lo_i(3)-1)
+        zci( k) = zci_g(kk)
+        zfi( k) = zfi_g(kk)
+      end do
+      do kk=lo_o(3)-1,hi_o(3)+1
+        k = kk-(lo_o(3)-1)
+        zco( k) = zco_g(kk)
+        zfo( k) = zfo_g(kk)
+      end do
+      !
+      ! interpolate field from mesh 'i' to mesh 'o'
+      !
+      call interp_fld([.true. ,.false.,.false.],lo_i,lo_o,hi_o,dli,dlo,ui,uo,zci,zco)
+      call interp_fld([.false.,.true. ,.false.],lo_i,lo_o,hi_o,dli,dlo,vi,vo,zci,zco)
+      call interp_fld([.false.,.false.,.true. ],lo_i,lo_o,hi_o,dli,dlo,wi,wo,zfi,zfo)
+      call interp_fld([.false.,.false.,.false.],lo_i,lo_o,hi_o,dli,dlo,pi,po,zci,zco)
+    end block
+#else
     !
-    ! interpolate field from grid 'i' to mesh 'o'
+    ! interpolate field from mesh 'i' to mesh 'o'
     !
     call interp_fld([.true. ,.false.,.false.],lo_i,lo_o,hi_o,dli,dlo,ui,uo)
     call interp_fld([.false.,.true. ,.false.],lo_i,lo_o,hi_o,dli,dlo,vi,vo)
     call interp_fld([.false.,.false.,.true. ],lo_i,lo_o,hi_o,dli,dlo,wi,wo)
     call interp_fld([.false.,.false.,.false.],lo_i,lo_o,hi_o,dli,dlo,pi,po)
+#endif
     !
     call load('w',output_file,MPI_COMM_WORLD,myid,no,[1,1,1],lo_o,hi_o,uo,vo,wo,po,time,istep)
     call MPI_FINALIZE(ierr)
   contains
-    subroutine interp_fld(is_staggered,lo_i,lo_o,hi_o,dli,dlo,fldi,fldo)
+    subroutine interp_fld(is_staggered,lo_i,lo_o,hi_o,dli,dlo,fldi,fldo,z1di,z1do)
       implicit none
       logical , intent(in ), dimension(3) :: is_staggered
       integer , intent(in ), dimension(3) :: lo_i,lo_o,hi_o
       real(rp), intent(in ), dimension(3) :: dli,dlo
       real(rp), intent(in ), dimension(lo_i(1)-1:,lo_i(2)-1:,lo_i(3)-1:) :: fldi
       real(rp), intent(out), dimension(lo_o(1)-1:,lo_o(2)-1:,lo_o(3)-1:) :: fldo
+      real(rp), intent(in ), optional, dimension(lo_i(3)-1:) :: z1di
+      real(rp), intent(in ), optional, dimension(lo_o(3)-1:) :: z1do
       real(rp), dimension(3) :: ds
       real(rp) :: deltax,deltay,deltaz
       integer  :: i,j,k,ii,ji,ki,iip,jip,kip,iim,jim,kim
@@ -188,6 +232,7 @@
       where(.not.is_staggered(:)) ds(:) = 0._rp
       !
       do k=lo_o(3),hi_o(3)
+#ifndef _NON_UNIFORM_Z
         zo = (k-ds(3))*dlo(3)
         ki = nint(zo/dli(3)+ds(3))
         kip = ki + 1
@@ -202,6 +247,22 @@
         zm = (kim-ds(3))*dli(3)
         zp = (kip-ds(3))*dli(3)
         deltaz = (zo-zm)/(zp-zm)
+#else
+        zo = z1do(k)
+        ki = minloc(abs(zo-z1di(:)),dim=1)
+        kip = ki + 1
+        kim = ki - 1
+        if(abs(z1di(kip)-zo) <= abs(z1di(kim)-zo)) then
+          kip = kip
+          kim = ki
+        else
+          kip = ki
+          kim = kim
+        endif
+        zm = z1di(kim)
+        zp = z1di(kip)
+        deltaz = (zo-zm)/(zp-zm)
+#endif
         do j=lo_o(2),hi_o(2)
           yo  = (j-ds(2))*dlo(2)
           ji  = nint(yo/dli(2)+ds(2))

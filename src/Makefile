@@ -10,14 +10,15 @@ NAME := interpit
 TARGET := $(NAME)
 
 PWD=$(shell pwd)
-ROOTDIR := $(PWD)/..
-SRCDIR := $(ROOTDIR)/src
-APPDIR := $(ROOTDIR)/app
-EXEDIR := $(ROOTDIR)/exe
-INCDIR := $(SRCDIR)/include
-CONFIGDIR := $(SRCDIR)/configs
+ROOT_DIR := $(PWD)/..
+SRC_DIR := $(ROOT_DIR)/src
+APP_DIR := $(ROOT_DIR)/app
+EXE_DIR := $(ROOT_DIR)/exe
+CONFIG_DIR := $(SRC_DIR)/configs
 
-EXE := $(EXEDIR)/$(TARGET)
+DEFINES :=
+
+EXE := $(EXE_DIR)/$(TARGET)
 
 # Configuration settings
 FC := mpifort
@@ -27,12 +28,13 @@ LD := $(FC)
 RM := rm -f
 GD := ./.gen-deps.awk
 
-include $(CONFIGDIR)/build.conf
-include $(INCDIR)/flags.mk
-include $(INCDIR)/compilers.mk
+# edit config/build.conf file desired
+include $(CONFIG_DIR)/build.conf
+include $(CONFIG_DIR)/flags.mk
+include $(CONFIG_DIR)/compilers.mk
 
 # List of all source files
-SRCS := $(wildcard $(SRCDIR)/*.f90) $(wildcard $(APPDIR)/*.f90)
+SRCS := $(wildcard $(SRC_DIR)/*.f90) $(wildcard $(APP_DIR)/*.f90)
 TEST_SRCS := 
 
 # Define a map from each file name to its object file
@@ -61,12 +63,12 @@ $(TEST_EXE): %.exe: %.f90.o $(LIB)
 	$(LD) -o $@ $^
 
 $(EXE): $(OBJS)
-	mkdir -p $(EXEDIR)/data
+	mkdir -p $(EXE_DIR)/data
 	$(FC) $(FFLAGS) $^ -o $(EXE)
 
 # Create object files from Fortran source
 $(OBJS) $(TEST_OBJS): %.o: % | %.d
-	$(FC) $(FFLAGS) -c -o $@ $<
+	$(FC) $(FFLAGS) -cpp $(DEFINES) -c -o $@ $<
 
 # Process the Fortran source for module dependencies
 $(DEPS) $(TEST_DEPS): %.d: %
