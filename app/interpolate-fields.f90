@@ -8,10 +8,10 @@
     ! input domain parameters
     !
     real(rp), parameter,       dimension(3) :: l     = [1.5_rp,3._rp,1._rp]
-    integer , parameter,       dimension(3) :: ni    = [ 64, 64, 64]
-    integer , parameter,       dimension(3) :: no    = [128,128,128]
-    real(rp), parameter,       dimension(3) :: dlo   = l(:)/no(:)
+    integer , parameter,       dimension(3) :: ni    = [128,256, 72]
+    integer , parameter,       dimension(3) :: no    = [256,512,144]
     real(rp), parameter,       dimension(3) :: dli   = l(:)/ni(:)
+    real(rp), parameter,       dimension(3) :: dlo   = l(:)/no(:)
     !
     ! boundary conditions
     !
@@ -176,13 +176,22 @@
                zco_g(0:no(3)+1),zfo_g(0:no(3)+1))
       inquire(iolength=rlen) 1._rp
       open(99,file=input_grid_file ,access='direct',recl=4*ni(3)*rlen)
-      read(99,rec=1) bufi(0:ni(3)+1),bufi(0:ni(3)+1),zci_g(0:ni(3)+1),zfi_g(0:ni(3)+1)
+      read(99,rec=1) bufi(1:ni(3)),bufi(1:ni(3)),zci_g(1:ni(3)),zfi_g(1:ni(3))
       close(99)
       open(99,file=output_grid_file,access='direct',recl=4*no(3)*rlen)
-      read(99,rec=1) bufo(0:no(3)+1),bufo(0:no(3)+1),zco_g(0:no(3)+1),zfo_g(0:no(3)+1)
+      read(99,rec=1) bufo(1:no(3)),bufo(1:no(3)),zco_g(1:no(3)),zfo_g(1:no(3))
       close(99)
-      allocate(zci_g(0:nni(3)+1),zfi_g(0:nni(3)+1), &
-               zco_g(0:nno(3)+1),zfo_g(0:nno(3)+1))
+      zfi_g(0) = 0._rp
+      zfo_g(0) = 0._rp
+      zci_g(0) = -zci_g(1)
+      zco_g(0) = -zco_g(1)
+      zfi_g(ni(3)+1) = zfi_g(ni(3)) + (zfi_g(ni(3))-zfi_g(ni(3)-1))
+      zfo_g(no(3)+1) = zfo_g(no(3)) + (zfo_g(no(3))-zfo_g(no(3)-1))
+      zci_g(ni(3)+1) = zci_g(ni(3)) + 0.5_rp*(zfi_g(ni(3))-zfi_g(ni(3)-2))
+      zco_g(no(3)+1) = zco_g(no(3)) + 0.5_rp*(zfo_g(no(3))-zfo_g(no(3)-2))
+
+      allocate(zci(0:nni(3)+1),zfi(0:nni(3)+1), &
+               zco(0:nno(3)+1),zfo(0:nno(3)+1))
       do kk=lo_i(3)-1,hi_i(3)+1
         k = kk-(lo_i(3)-1)
         zci( k) = zci_g(kk)
@@ -249,7 +258,7 @@
         deltaz = (zo-zm)/(zp-zm)
 #else
         zo = z1do(k)
-        ki = minloc(abs(zo-z1di(:)),dim=1)
+        ki = minloc(abs(zo-z1di(lo_i(3):hi_i(3))),dim=1)
         kip = ki + 1
         kim = ki - 1
         if(abs(z1di(kip)-zo) <= abs(z1di(kim)-zo)) then
