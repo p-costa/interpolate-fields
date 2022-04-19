@@ -12,4 +12,4 @@ jobs:
     - name: Install OpenMPI and gfortran
       run: sudo apt-get install gfortran libopenmpi-dev
     - name: Compile
-      run: cd src && make
+      run: make -j
