@@ -10,7 +10,7 @@ NAME := interpit
 TARGET := $(NAME)
 
 PWD=$(shell pwd)
-ROOT_DIR := $(PWD)/..
+ROOT_DIR := $(PWD)
 SRC_DIR := $(ROOT_DIR)/src
 APP_DIR := $(ROOT_DIR)/app
 EXE_DIR := $(ROOT_DIR)/exe
@@ -26,7 +26,7 @@ FFLAGS :=
 AR := ar rcs
 LD := $(FC)
 RM := rm -f
-GD := ./.gen-deps.awk
+GD := $(SRC_DIR)/.gen-deps.awk
 
 # edit config/build.conf file desired
 include $(CONFIG_DIR)/build.conf
