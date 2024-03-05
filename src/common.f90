@@ -3,5 +3,5 @@ module mod_common
   implicit none
   integer, parameter :: rp = selected_real_kind(15,307)
   integer :: ierr
-  integer :: nh = 2
+  integer :: nh = 1
 end module mod_common
