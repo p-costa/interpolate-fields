@@ -185,7 +185,7 @@
       zfo_g(0) = 0._rp
       zci_g(0) = -zci_g(1)
       zco_g(0) = -zco_g(1)
-      do k = 1, nh
+      do k=1,nh
         zfi_g(ni(3)+k) = zfi_g(ni(3)+k-1) + (zfi_g(ni(3)+1-k)-zfi_g(ni(3)-k))
         zfo_g(no(3)+k) = zfo_g(no(3)+k-1) + (zfo_g(no(3)+1-k)-zfo_g(no(3)-k))
         zci_g(ni(3)+k) = zci_g(ni(3)+k-1) + 0.5_rp*(zfi_g(ni(3)+1-k)-zfi_g(ni(3)-k))
