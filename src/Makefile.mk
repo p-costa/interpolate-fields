@@ -17,6 +17,8 @@ EXE_DIR := $(ROOT_DIR)/exe
 CONFIG_DIR := $(SRC_DIR)/configs
 
 DEFINES :=
+INCS :=
+LIBS :=
 
 EXE := $(EXE_DIR)/$(TARGET)
 
@@ -32,6 +34,7 @@ GD := $(SRC_DIR)/.gen-deps.awk
 include $(CONFIG_DIR)/build.conf
 include $(CONFIG_DIR)/flags.mk
 include $(CONFIG_DIR)/compilers.mk
+include $(CONFIG_DIR)/libs.mk
 
 # List of all source files
 SRCS := $(wildcard $(SRC_DIR)/*.f90) $(wildcard $(APP_DIR)/*.f90)
@@ -64,11 +67,11 @@ $(TEST_EXE): %.exe: %.f90.o $(LIB)
 
 $(EXE): $(OBJS)
 	mkdir -p $(EXE_DIR)/data
-	$(FC) $(FFLAGS) $^ -o $(EXE)
+	$(FC) $(FFLAGS) $^ $(LIBS) -o $(EXE)
 
 # Create object files from Fortran source
 $(OBJS) $(TEST_OBJS): %.o: % | %.d
-	$(FC) $(FFLAGS) -cpp $(DEFINES) -c -o $@ $<
+	$(FC) $(FFLAGS) -cpp $(DEFINES) $(INCS) -c -o $@ $<
 
 # Process the Fortran source for module dependencies
 $(DEPS) $(TEST_DEPS): %.d: %

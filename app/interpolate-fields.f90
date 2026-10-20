@@ -7,13 +7,14 @@
     ! one at a time, so that the memory footprint is that of one input and one output block per task
     !
     use mpi_f08
-    use mod_common, only: rp,dp,i8,ierr,myid,abort_run
-    use mod_param , only: read_input,vars,dims_in => dims,input_format,input_prefix,input_file,output_prefix, &
-                          output_precision,is_reset_time,ng_i,l_i,grid_files_i,ng_o,l_o,grid_files_o,is_periodic
+    use mod_common, only: rp,dp,i8,ierr,myid,abort_run,CHUNK_BYTES
+    use mod_param , only: read_input,vars,dims_in => dims,input_format,output_format,output_precision, &
+                          is_compress_output,is_reset_time,ng_i,l_i,grid_files_i,ng_o,l_o,grid_files_o, &
+                          is_periodic,input_file_name,output_file_name
     use mod_grid  , only: grid_1d,init_grid,is_same_length
     use mod_bound , only: set_ghosts
     use mod_interp, only: get_weights,interp_fld
-    use mod_io    , only: get_checkpoint_layout,read_fldinfo,read_block,write_field,CHUNK_BYTES
+    use mod_io    , only: get_checkpoint_layout,read_fldinfo,read_block,write_field
     implicit none
     !
     ! brackets and weights of the output points of a block along one direction (see `get_weights`)
@@ -87,21 +88,18 @@
       !
       ! input file, precision, time and time step
       !
-      select case(trim(input_format))
-      case('legacy')
-        fname_i = input_file
-        call get_checkpoint_layout(trim(fname_i),ng_i,.true.,iprec_i,nfields)
+      fname_i = input_file_name(var%name)
+      call get_checkpoint_layout(trim(fname_i),trim(input_format),trim(var%name),ng_i,iprec_i,nfields)
+      if(trim(input_format) == 'legacy') then
         if(var%ifield > nfields) &
           call abort_run('variable `'//trim(var%name)//'` is not in the legacy checkpoint `'//trim(fname_i)//'`.')
         disp      = (var%ifield-1)*ntot_i*iprec_i
         disp_info = nfields*ntot_i*iprec_i
-      case('per-variable')
-        fname_i = trim(input_prefix)//'_'//trim(var%name)//'.bin'
-        call get_checkpoint_layout(trim(fname_i),ng_i,.false.,iprec_i,nfields)
+      else
         disp      = 0
         disp_info = ntot_i*iprec_i
-      end select
-      call read_fldinfo(trim(fname_i),disp_info,iprec_i,time,istep)
+      end if
+      call read_fldinfo(trim(fname_i),trim(input_format),disp_info,iprec_i,time,istep)
       if(iv == 1) then
         time_1  = time
         istep_1 = istep
@@ -153,7 +151,7 @@
       allocate(fldi(lo_i(1):hi_i(1),lo_i(2):hi_i(2),lo_i(3):hi_i(3)))
       fldi(:,:,:) = 0._rp
       twi = MPI_WTIME()
-      call read_block(trim(fname_i),disp,ng_i,iprec_i,is_periodic,lo_i,hi_i,fldi)
+      call read_block(trim(fname_i),trim(input_format),trim(var%name),disp,ng_i,iprec_i,is_periodic,lo_i,hi_i,fldi)
       tw(1) = tw(1) + (MPI_WTIME()-twi)
       call print_stats(trim(var%name)//' (input) ',own_lo,own_hi,var%is_staggered,gi,lo_i,fldi)
       call set_ghosts(var%cbc,var%bc,var%is_staggered,gi,lo_i,hi_i,fldi)
@@ -183,9 +181,12 @@
         time_o  = 0._rp
         istep_o = 0
       end if
-      fname_o = trim(output_prefix)//'_'//trim(var%name)//'.bin'
+      fname_o = output_file_name(var%name)
       twi = MPI_WTIME()
-      call write_field(trim(fname_o),ng_o,lo_o,hi_o,iprec_o,fldo,time_o,istep_o)
+      call write_field(trim(fname_o),trim(output_format),trim(var%name),ng_o,lo_o,hi_o,iprec_o,fldo,time_o,istep_o, &
+                       merge(go(1)%xf,go(1)%xc,var%is_staggered(1)), &
+                       merge(go(2)%xf,go(2)%xc,var%is_staggered(2)), &
+                       merge(go(3)%xf,go(3)%xc,var%is_staggered(3)),is_compress_output)
       tw(3) = tw(3) + (MPI_WTIME()-twi)
       if(myid == 0) print*, '  written to `', trim(fname_o), '` (', merge('single','double',iprec_o == 4), &
                             ' precision), at time = ', time_o, 'step = ', istep_o

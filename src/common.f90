@@ -9,6 +9,7 @@ module mod_common
                         dp = selected_real_kind(15,307), &
                         rp = dp
   integer, parameter :: i8 = selected_int_kind(18)
+  integer(i8), parameter :: CHUNK_BYTES = 64*2_i8**20 ! size of the conversion buffer for single-precision output
   integer :: ierr
   integer :: myid = 0
 contains

@@ -6,7 +6,11 @@ module mod_grid
   ! spacings between cell centres
   !
   use mpi_f08
-  use mod_common, only: rp,sp,dp,i8,myid,ierr,abort_run
+  use mod_common , only: rp,sp,dp,i8,myid,ierr,abort_run
+  use mod_io_hdf5, only: is_hdf5_file,MSG_NO_HDF5
+#if defined(_USE_HDF5)
+  use mod_io_hdf5, only: h5_read_grid
+#endif
   implicit none
   private
   public grid_1d,init_grid,is_same_length
@@ -22,8 +26,9 @@ contains
     !
     ! sets a uniform grid with n cells over a length l if `fname` is blank; otherwise, reads the grid from
     ! a CaNS grid file (`grid.bin`, or `grid_x.bin`, `grid_y.bin` and `grid_z.bin` in CaNS-EIGEN) with
-    ! [dzc(1:n),dzf(1:n),zc(1:n),zf(1:n)] in single or double precision (detected from the file size);
-    ! the length is then that of the file, and l, if positive, is checked against it
+    ! [dzc(1:n),dzf(1:n),zc(1:n),zf(1:n)] in single or double precision (detected from the file size), or
+    ! from its HDF5 version (`grid*.h5`, datasets `rc` and `rf`); the length is then that of the file,
+    ! and l, if positive, is checked against it
     !
     implicit none
     integer         , intent(in ) :: n
@@ -34,7 +39,7 @@ contains
     real(sp), allocatable, dimension(:,:) :: buf_sp
     real(dp), allocatable, dimension(:,:) :: buf_dp
     integer(i8) :: fsize
-    integer :: i,iunit
+    integer :: i,iunit,istat
     character(len=16) :: cn
     !
     if(n < 1) call abort_run('the number of grid cells `ng` must be prescribed and positive.')
@@ -52,30 +57,50 @@ contains
         g%xc(i) = ((i-0.5_rp)*l)/n
       end do
     else
-      fsize = -1
-      if(myid == 0) inquire(file=trim(fname),size=fsize)
-      call MPI_BCAST(fsize,1,MPI_INTEGER8,0,MPI_COMM_WORLD,ierr)
       write(cn,'(i0)') n
-      if(fsize < 0) call abort_run('could not open grid file `'//trim(fname)//'`.')
-      if(     fsize == 4*int(n,i8)*storage_size(1._sp)/8) then
-        g%iprec = 4
-      else if(fsize == 4*int(n,i8)*storage_size(1._dp)/8) then
-        g%iprec = 8
-      else
-        call abort_run('the size of grid file `'//trim(fname)//'` is not that of a grid with '//trim(cn)// &
-                       ' cells (four arrays of n values, in single or double precision).')
-      end if
       allocate(buf_dp(n,4))
-      if(myid == 0) then
-        open(newunit=iunit,file=trim(fname),access='stream',form='unformatted',status='old',action='read')
-        if(g%iprec == 4) then
-          allocate(buf_sp(n,4))
-          read(iunit) buf_sp(:,:)
-          buf_dp(:,:) = buf_sp(:,:)
+      buf_dp(:,:) = 0._dp
+      if(is_hdf5_file(fname)) then
+        istat = 0
+        g%iprec = 0
+#if defined(_USE_HDF5)
+        if(myid == 0) call h5_read_grid(fname,n,istat,g%iprec,buf_dp(:,3),buf_dp(:,4))
+#else
+        call abort_run(MSG_NO_HDF5)
+#endif
+        call MPI_BCAST(istat  ,1,MPI_INTEGER,0,MPI_COMM_WORLD,ierr)
+        call MPI_BCAST(g%iprec,1,MPI_INTEGER,0,MPI_COMM_WORLD,ierr)
+        select case(istat)
+        case(1)
+          call abort_run('could not open grid file `'//trim(fname)//'`.')
+        case(2,3)
+          call abort_run('grid file `'//trim(fname)//'` has no real datasets `rc` and `rf` of '//trim(cn)// &
+                         ' values.')
+        end select
+      else
+        fsize = -1
+        if(myid == 0) inquire(file=trim(fname),size=fsize)
+        call MPI_BCAST(fsize,1,MPI_INTEGER8,0,MPI_COMM_WORLD,ierr)
+        if(fsize < 0) call abort_run('could not open grid file `'//trim(fname)//'`.')
+        if(     fsize == 4*int(n,i8)*storage_size(1._sp)/8) then
+          g%iprec = 4
+        else if(fsize == 4*int(n,i8)*storage_size(1._dp)/8) then
+          g%iprec = 8
         else
-          read(iunit) buf_dp(:,:)
+          call abort_run('the size of grid file `'//trim(fname)//'` is not that of a grid with '//trim(cn)// &
+                         ' cells (four arrays of n values, in single or double precision).')
         end if
-        close(iunit)
+        if(myid == 0) then
+          open(newunit=iunit,file=trim(fname),access='stream',form='unformatted',status='old',action='read')
+          if(g%iprec == 4) then
+            allocate(buf_sp(n,4))
+            read(iunit) buf_sp(:,:)
+            buf_dp(:,:) = buf_sp(:,:)
+          else
+            read(iunit) buf_dp(:,:)
+          end if
+          close(iunit)
+        end if
       end if
       call MPI_BCAST(buf_dp,4*n,MPI_DOUBLE_PRECISION,0,MPI_COMM_WORLD,ierr)
       g%xc(1:n) = buf_dp(:,3)

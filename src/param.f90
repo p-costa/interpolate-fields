@@ -2,12 +2,13 @@ module mod_param
   !
   ! input parameters, read from a namelist file (see the README)
   !
-  use mod_common, only: rp,myid,abort_run
+  use mod_common , only: rp,myid,abort_run
+  use mod_io_hdf5, only: is_hdf5_enabled,is_hdf5_file
   implicit none
   private
-  public read_input,var_t
-  public dims,input_format,input_prefix,input_file,output_prefix,output_precision,is_reset_time, &
-         ng_i,l_i,grid_files_i,ng_o,l_o,grid_files_o,is_periodic,vars
+  public read_input,var_t,input_file_name,output_file_name
+  public dims,input_format,input_prefix,input_file,output_format,output_prefix,output_precision, &
+         is_compress_output,is_reset_time,ng_i,l_i,grid_files_i,ng_o,l_o,grid_files_o,is_periodic,vars
   integer, parameter :: MAX_VARS = 128, & ! maximum number of variables processed
                         MAX_SCAL = 999    ! maximum number of scalars, `s_001` to `s_999`, as in CaNS
   integer, parameter :: LEN_NAME = 32, LEN_FILE = 256
@@ -27,9 +28,9 @@ module mod_param
   ! &interp
   !
   integer                , protected, dimension(3) :: dims
-  character(len=16)      , protected :: input_format,output_precision
+  character(len=16)      , protected :: input_format,output_format,output_precision
   character(len=LEN_FILE), protected :: input_prefix,input_file,output_prefix
-  logical                , protected :: is_reset_time
+  logical                , protected :: is_compress_output,is_reset_time
   !
   ! &grid_in and &grid_out
   !
@@ -70,16 +71,28 @@ contains
     !
     if(any(dims(:) < 0)) call abort_run('`dims` must not be negative.')
     select case(trim(input_format))
-    case('per-variable')
+    case('per-variable','hdf5')
       if(len_trim(input_prefix) == 0) &
-        call abort_run('`input_prefix` must be prescribed for `input_format = ''per-variable''`.')
+        call abort_run('`input_prefix` must be prescribed for `input_format = '''//trim(input_format)//'''`.')
     case('legacy')
       if(len_trim(input_file) == 0) &
         call abort_run('`input_file` must be prescribed for `input_format = ''legacy''`.')
     case default
-      call abort_run('`input_format` must be ''per-variable'' or ''legacy''.')
+      call abort_run('`input_format` must be ''per-variable'', ''legacy'' or ''hdf5''.')
+    end select
+    select case(trim(output_format))
+    case('per-variable','hdf5')
+    case default
+      call abort_run('`output_format` must be ''per-variable'' or ''hdf5''.')
     end select
     if(len_trim(output_prefix) == 0) call abort_run('`output_prefix` must be prescribed.')
+    if(.not.is_hdf5_enabled .and. (trim(input_format) == 'hdf5' .or. trim(output_format) == 'hdf5' .or. &
+                                   any([(is_hdf5_file(trim(grid_files_i(iv))),iv=1,3)]) .or. &
+                                   any([(is_hdf5_file(trim(grid_files_o(iv))),iv=1,3)]))) &
+      call abort_run('HDF5 input or output requested, but HDF5 support is not compiled in: '// &
+                     'rebuild with `USE_HDF5=1`.')
+    if(is_compress_output .and. trim(output_format) /= 'hdf5' .and. myid == 0) &
+      print*, 'WARNING: `is_compress_output` is ignored for `output_format = ''per-variable''`.'
     select case(trim(output_precision))
     case('input','single','double')
     case default
@@ -146,16 +159,41 @@ contains
     ! the output must not overwrite the input
     !
     do iv=1,nvars
-      select case(trim(input_format))
-      case('per-variable')
-        if(trim(input_prefix) == trim(output_prefix)) &
-          call abort_run('`output_prefix` must differ from `input_prefix`.')
-      case('legacy')
-        if(trim(input_file) == trim(output_prefix)//'_'//trim(vars(iv)%name)//'.bin') &
-          call abort_run('the output file of variable `'//trim(vars(iv)%name)//'` would overwrite the input.')
-      end select
+      if(input_file_name(vars(iv)%name) == output_file_name(vars(iv)%name)) &
+        call abort_run('the output file of variable `'//trim(vars(iv)%name)//'` would overwrite its input.')
     end do
   end subroutine read_input
+  !
+  function input_file_name(name) result(fname)
+    !
+    ! input file of variable `name`: `<input_prefix>_<name>.bin` or `.h5`, or the legacy `input_file`
+    !
+    implicit none
+    character(len=*), intent(in) :: name
+    character(len=:), allocatable :: fname
+    select case(trim(input_format))
+    case('legacy')
+      fname = trim(input_file)
+    case('hdf5')
+      fname = trim(input_prefix)//'_'//trim(name)//'.h5'
+    case default
+      fname = trim(input_prefix)//'_'//trim(name)//'.bin'
+    end select
+  end function input_file_name
+  !
+  function output_file_name(name) result(fname)
+    !
+    ! output file of variable `name`: `<output_prefix>_<name>.bin` or `.h5`
+    !
+    implicit none
+    character(len=*), intent(in) :: name
+    character(len=:), allocatable :: fname
+    if(trim(output_format) == 'hdf5') then
+      fname = trim(output_prefix)//'_'//trim(name)//'.h5'
+    else
+      fname = trim(output_prefix)//'_'//trim(name)//'.bin'
+    end if
+  end function output_file_name
   !
   subroutine read_nml_interp(iunit,fname,variables)
     implicit none
@@ -165,15 +203,17 @@ contains
     integer :: istat
     character(len=256) :: errmsg
     namelist /interp/ dims,variables,input_format,input_prefix,input_file, &
-                      output_prefix,output_precision,is_reset_time
+                      output_format,output_prefix,output_precision,is_compress_output,is_reset_time
     !
     dims(:)          = [1,0,0]
     variables(:)     = ''
     input_format     = 'per-variable'
     input_prefix     = ''
     input_file       = ''
+    output_format    = 'per-variable'
     output_prefix    = ''
     output_precision = 'input'
+    is_compress_output = .false.
     is_reset_time    = .false.
     rewind(iunit)
     read(iunit,nml=interp,iostat=istat,iomsg=errmsg)

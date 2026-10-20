@@ -1,0 +1,1 @@
+option('hdf5', type: 'boolean', value: false, description: 'HDF5 I/O support (parallel HDF5 with Fortran)')

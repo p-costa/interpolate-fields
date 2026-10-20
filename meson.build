@@ -1,13 +1,23 @@
 project('interpit', 'fortran', meson_version: '>=0.49')
 
-sources = files('src/bound.f90',  \
-                'src/common.f90', \
-                'src/grid.f90',   \
-                'src/interp.f90', \
-                'src/io.f90',     \
-                'src/param.f90',  \
+sources = files('src/bound.f90',   \
+                'src/common.f90',  \
+                'src/grid.f90',    \
+                'src/interp.f90',  \
+                'src/io.f90',      \
+                'src/io_hdf5.f90', \
+                'src/param.f90',   \
                 'app/interpolate-fields.f90')
 
-mpif    = dependency('mpi', language: 'fortran', required: true)
+# the sources are preprocessed (optional HDF5 support)
+fc = meson.get_compiler('fortran')
+cpp_flags = {'gcc': '-cpp', 'intel': '-fpp', 'intel-llvm': '-fpp', 'nvidia_hpc': '-Mpreprocess'}
+add_project_arguments(cpp_flags.get(fc.get_id(), '-cpp'), language: 'fortran')
 
-executable('interpit', sources, dependencies: [mpif])
+deps = [dependency('mpi', language: 'fortran', required: true)]
+if get_option('hdf5')
+  deps += dependency('hdf5', language: 'fortran', required: true)
+  add_project_arguments('-D_USE_HDF5', language: 'fortran')
+endif
+
+executable('interpit', sources, dependencies: deps)
