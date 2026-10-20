@@ -14,7 +14,9 @@ The case is set in a namelist file (default: `interp.nml` in the working directo
 
 * reads, for each variable, the input checkpoint, in single or double precision (detected from the file size, or from the HDF5 dataset);
 * imposes the boundary conditions on the ghost points, as CaNS does;
+* optionally, subtracts the volume-weighted mean or a constant offset (see `&operations`);
 * interpolates the field onto the output grid by trilinear interpolation, in double precision, with weights from the actual coordinates of the variable's location; output points that coincide with input points reproduce them exactly;
+* optionally, subtracts the residual mean of the interpolated field, and adds a uniform velocity to u, v and w (change of reference frame);
 * writes the output in the current CaNS checkpoint format, one file per variable, `<output_prefix>_<var>.bin` (the field followed by the time and the time step) or `<output_prefix>_<var>.h5`, in the chosen precision.
 
 Each MPI task owns a block of the output grid and reads exactly the block of the input field that it needs (plus, when the output grid is coarser, the input points between the blocks, for the statistics), wrapping around periodic directions, so that any process grid can be used, with z decomposed or not, and without divisibility constraints. The variables are processed one at a time: the memory footprint per task is that of one input block, plus one output block in double precision (and, for single-precision output, a conversion buffer of at most 64 MiB). The program prints, per variable, the minimum, maximum and volume-weighted mean of the input and output fields, and, at the end, the time spent reading, interpolating and writing, and the memory of the field arrays.
@@ -60,6 +62,17 @@ One group per variable that is not `u`, `v`, `w`, `p` or a scalar (e.g., a vorti
 
 The locations of the other variables follow from their names: `u` is staggered along x (`'scc'`), `v` along y (`'csc'`), `w` along z (`'ccs'`), and `p` and the scalars are cell-centred (`'ccc'`).
 
+### `&operations`
+Field operations (optional), per variable in the order of `variables` (with the default variables, `u`, `v`, `w`, `p` are 1 to 4):
+
+| parameter | default | meaning |
+|---|---|---|
+| `is_remove_mean(:)` | `F` | subtract the volume-weighted mean: that of the input before the interpolation, in double precision (so that the interpolation works with O(1) values, e.g. for a pressure whose mean has drifted to large values in a long run, which single precision cannot resolve around its fluctuations), and then the small residual mean of the interpolated field (interpolation does not preserve the mean exactly on non-uniform grids), so that the output mean is zero to round-off |
+| `offset(:)` | `0.` | constant subtracted from the input (exclusive with `is_remove_mean`) |
+| `vel_frame(1:3)` | `0., 0., 0.` | uniform velocity added to `u`, `v` and `w` after the interpolation (change of reference frame) |
+
+The mean is weighted with the control volumes of the variable's location: the cells along cell-centred directions, and the spacings between cell centres along staggered directions (at a bounded upper boundary, the half cell next to it; the lower boundary face is not stored in the files). The boundary conditions refer to the input fields: a subtracted mean or offset shifts the Dirichlet values alike (the ghost points are shifted with the field). After a change of reference frame, the CaNS run that uses the output must set its wall velocities and `velf` for the new frame: e.g., for a channel in the frame moving with the bulk velocity `ub` of a lab-frame run, `vel_frame(1) = -ub`, and the new run has `bcvel(0:1,3,1) = -ub, -ub` and `velf(1) = 0.`. The value subtracted or added is printed for each variable and operation.
+
 ### Boundary conditions and ghost points
 As in CaNS (`set_bc`): along a periodic direction, the field wraps around; along a bounded direction, a cell-centred variable gets ghost points mirrored about the boundary (Dirichlet: `f(0) = 2*bc - f(1)`; Neumann: `f(0) = f(1) - dzc(0)*bc`), and a staggered variable gets its values on the boundary faces (Dirichlet: `f(0) = bc` and `f(n) = bc`; Neumann: `f(0) = f(1) - dzf(0)*bc` and `f(n) = f(n-1) + dzf(n)*bc`). Fields that are linear in space and consistent with these conditions are therefore interpolated exactly, also near the boundaries. Immersed boundaries get no special treatment: solid regions are interpolated like the fluid.
 
@@ -92,8 +105,11 @@ cbcvel(0:1,1:3,3) = 'P','P',  'P','P',  'D','D'
 cbcpre(0:1,1:3)   = 'P','P',  'P','P',  'N','N'
 bcvel(0:1,1:3,1)  = 0.,0.,  0.,0.,  -1.,-1.
 /
+&operations
+is_remove_mean(4) = T
+/
 ```
-The wall velocity `bcvel(:,3,1) = -1` is that of a run in a reference frame moving with the bulk velocity.
+The wall velocity `bcvel(:,3,1) = -1` is that of a run in a reference frame moving with the bulk velocity. The mean of the pressure is removed, so that its fluctuations are resolved in single precision.
 
 ### CaNS-EIGEN periodic duct (non-uniform along all directions)
 Interpolation of all fields, including a passive scalar, of a duct (periodic along x, walls along y and z), with the grid files written by CaNS-EIGEN for the input and output runs:
@@ -128,4 +144,4 @@ cbc(0:1,1:3) = 'P','P',  'D','D',  'N','N'
 ```
 
 ## Tests
-`tests/run_tests.py` (Python 3 with NumPy) runs the program on small synthetic cases, with several process grids: identity on the same grid, exactness for linear fields at all variable locations, bitwise process-grid independence and agreement with an independent NumPy implementation, precision conversion, legacy and per-variable input, HDF5 input and output (with [h5py](https://www.h5py.org), for a build with HDF5; otherwise, the error message), the defaults, and the input checks. Run it after building, e.g. `python3 tests/run_tests.py` (see `--help`; the MPI launcher can be set with the environment variable `MPIRUN`).
+`tests/run_tests.py` (Python 3 with NumPy) runs the program on small synthetic cases, with several process grids: identity on the same grid, exactness for linear fields at all variable locations, bitwise process-grid independence and agreement with an independent NumPy implementation, precision conversion, legacy and per-variable input, field operations, HDF5 input and output (with [h5py](https://www.h5py.org), for a build with HDF5; otherwise, the error message), the defaults, and the input checks. Run it after building, e.g. `python3 tests/run_tests.py` (see `--help`; the MPI launcher can be set with the environment variable `MPIRUN`).
