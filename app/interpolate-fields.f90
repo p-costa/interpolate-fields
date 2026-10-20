@@ -16,6 +16,7 @@
     use mod_bound , only: set_ghosts
     use mod_interp, only: get_weights,interp_fld
     use mod_io    , only: get_checkpoint_layout,read_fldinfo,read_block,write_field
+    use mod_decomp, only: distribute_grid
     implicit none
     !
     ! brackets and weights of the output points of a block along one direction (see `get_weights`)
@@ -274,20 +275,6 @@
     end if
     call MPI_FINALIZE(ierr)
   contains
-    subroutine distribute_grid(ng,dims,coords,n,lo,hi)
-      !
-      ! block of the task with coordinates `coords` in the process grid; along each direction,
-      ! the first mod(ng,dims) tasks get one more point
-      !
-      implicit none
-      integer, intent(in ), dimension(3) :: ng,dims,coords
-      integer, intent(out), dimension(3) :: n,lo,hi
-      n(:)  = ng(:)/dims(:)
-      lo(:) = 1 + coords(:)*n(:) + min(coords(:),mod(ng(:),dims(:)))
-      where(coords(:) < mod(ng(:),dims(:))) n(:) = n(:) + 1
-      hi(:) = lo(:) + n(:) - 1
-    end subroutine distribute_grid
-    !
     subroutine print_grid(label,g,fname)
       implicit none
       character(len=*), intent(in) :: label,fname

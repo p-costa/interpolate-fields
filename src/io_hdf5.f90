@@ -18,7 +18,8 @@ module mod_io_hdf5
   private
   public is_hdf5_enabled,is_hdf5_file,MSG_NO_HDF5
 #if defined(_USE_HDF5)
-  public h5_get_field_layout,h5_read_fldinfo,h5_read_block,h5_write_field,h5_read_grid
+  public h5_get_field_layout,h5_read_fldinfo,h5_read_block,h5_open_output,h5_write_output_block,h5_close_output, &
+         h5_read_grid
   logical, parameter :: is_hdf5_enabled = .true.
 #else
   logical, parameter :: is_hdf5_enabled = .false.
@@ -236,33 +237,30 @@ contains
     call h5close_f(hdferr)
   end subroutine h5_read_block
   !
-  subroutine h5_write_field(fname,varname,ng,lo,hi,iprec,p,time,istep,x,y,z,is_compress)
+  subroutine h5_open_output(fname,varname,ng,iprec,is_compress,nchunk,ids)
     !
-    ! writes an HDF5 checkpoint in single or double precision (iprec = 4 or 8 bytes): each task writes its
-    ! block p(lo(1):hi(1),lo(2):hi(2),lo(3):hi(3)), converted to single precision by chunks of planes if needed;
-    ! then task 0 writes the time, the time step and the coordinates x(0:ng(1)+1), y(0:ng(2)+1), z(0:ng(3)+1)
-    ! of the variable's location; with compression, the dataset is chunked and gzip-compressed (with the
-    ! shuffle filter), as in CaNS (`hdf5_checkpoint_chunk_dims`)
+    ! creates an HDF5 checkpoint with dataset `fields/<varname>` of ng points in single or double precision
+    ! (iprec = 4 or 8 bytes); with compression, the dataset is chunked and gzip-compressed (with the shuffle
+    ! filter), as in CaNS (`hdf5_checkpoint_chunk_dims`): the chunks are blocks of nchunk points, halved
+    ! along each direction in turn down to 2 MiB; ids: the file and dataset identifiers
     !
     implicit none
     character(len=*), intent(in) :: fname,varname
-    integer , intent(in), dimension(3) :: ng,lo,hi
+    integer , intent(in), dimension(3) :: ng
     integer , intent(in) :: iprec
-    real(rp), intent(in), contiguous, dimension(lo(1):,lo(2):,lo(3):) :: p
-    real(rp), intent(in) :: time
-    integer , intent(in) :: istep
-    real(rp), intent(in), dimension(0:) :: x,y,z
-    logical , intent(in) :: is_compress
+    logical , intent(in), optional :: is_compress
+    integer , intent(in), dimension(3), optional :: nchunk
+    integer(i8), intent(out), dimension(2) :: ids
     integer, parameter :: COMPRESSION_LEVEL = 4
     integer(i8), parameter :: CHUNK_MAX = 2*2_i8**20 ! 2 MiB, as in CaNS
-    real(sp), allocatable, dimension(:,:,:) :: buf_sp
-    integer(HID_T) :: file_id,group_id,dset,filespace,memspace,plist_id,dcpl_id,dtype
-    integer(HSIZE_T), dimension(3) :: dims,offset,count,chunk_dims
-    integer , dimension(3) :: n,nn
-    integer :: hdferr,istat,idir,nzc,nchunks,ic,k0,nk
-    logical :: is_reduced
+    integer(HID_T) :: file_id,group_id,dset,filespace,plist_id,dcpl_id,dtype
+    integer(HSIZE_T), dimension(3) :: dims,chunk_dims
+    integer , dimension(3) :: nn
+    integer :: hdferr,istat,idir
+    logical :: is_reduced,is_compress_
     !
-    n(:) = hi(:)-lo(:)+1
+    is_compress_ = .false.
+    if(present(is_compress)) is_compress_ = is_compress
     call h5open_f(hdferr)
     dtype = H5T_NATIVE_DOUBLE ! (the HDF5 predefined types are set by `h5open_f`)
     if(iprec == 4) dtype = H5T_NATIVE_REAL
@@ -275,11 +273,8 @@ contains
     dims(:) = ng(:)
     call h5screate_simple_f(3,dims,filespace,hdferr)
     call h5pcreate_f(H5P_DATASET_CREATE_F,dcpl_id,hdferr)
-    if(is_compress) then
-      !
-      ! chunks: the smallest block over the tasks, halved along each direction in turn down to `CHUNK_MAX`
-      !
-      call MPI_ALLREDUCE(n,nn,3,MPI_INTEGER,MPI_MIN,MPI_COMM_WORLD,ierr)
+    if(is_compress_) then
+      nn(:) = max(nchunk(:),1)
       do while(product(int(nn,i8))*iprec > CHUNK_MAX)
         is_reduced = .false.
         do idir=1,3
@@ -298,7 +293,35 @@ contains
     end if
     call h5dcreate_f(group_id,varname,dtype,filespace,dset,hdferr,dcpl_id=dcpl_id)
     call h5pclose_f(dcpl_id,hdferr)
+    call h5sclose_f(filespace,hdferr)
     call h5gclose_f(group_id,hdferr)
+    ids(:) = [file_id,dset]
+  end subroutine h5_open_output
+  !
+  subroutine h5_write_output_block(ids,iprec,lo,hi,p)
+    !
+    ! writes the block p(lo(1):hi(1),lo(2):hi(2),lo(3):hi(3)) of each task (none if hi < lo) to the dataset
+    ! of an output file, converted to single precision by chunks of planes if needed; collective
+    !
+    implicit none
+    integer(i8), intent(in), dimension(2) :: ids
+    integer , intent(in) :: iprec
+    integer , intent(in), dimension(3) :: lo,hi
+    real(rp), intent(in), contiguous, dimension(lo(1):,lo(2):,lo(3):) :: p
+    real(sp), allocatable, dimension(:,:,:) :: buf_sp
+    real(dp), dimension(1,1,1) :: dummy_dp
+    integer(HID_T) :: dset,filespace,memspace,plist_id,dtype
+    integer(HSIZE_T), dimension(3) :: offset,count
+    integer , dimension(3) :: n
+    integer :: hdferr,nzc,nchunks,ic,k0,nk
+    logical :: is_empty
+    !
+    dset = ids(2)
+    n(:) = max(hi(:)-lo(:)+1,0)
+    is_empty = any(n(:) == 0)
+    dtype = H5T_NATIVE_DOUBLE
+    if(iprec == 4) dtype = H5T_NATIVE_REAL
+    call h5dget_space_f(dset,filespace,hdferr)
     call h5pcreate_f(H5P_DATASET_XFER_F,plist_id,hdferr)
     call h5pset_dxpl_mpio_f(plist_id,H5FD_MPIO_COLLECTIVE_F,hdferr)
     if(iprec == 4) then
@@ -306,15 +329,17 @@ contains
       ! convert and write in chunks of nzc planes; all tasks make the same number of collective calls
       ! (with empty selections once their block is written)
       !
-      nzc = int(max(1_i8,min(int(n(3),i8),CHUNK_BYTES/(4*int(n(1),i8)*n(2)))))
+      nzc = 1
+      if(.not.is_empty) nzc = int(max(1_i8,min(int(n(3),i8),CHUNK_BYTES/(4*int(n(1),i8)*n(2)))))
       nchunks = (n(3)+nzc-1)/nzc
       call MPI_ALLREDUCE(MPI_IN_PLACE,nchunks,1,MPI_INTEGER,MPI_MAX,MPI_COMM_WORLD,ierr)
-      allocate(buf_sp(n(1),n(2),nzc))
-      count(:) = [n(1),n(2),nzc]
+      allocate(buf_sp(max(n(1),1),max(n(2),1),nzc))
+      count(:) = shape(buf_sp)
       call h5screate_simple_f(3,count,memspace,hdferr)
       do ic=1,nchunks
         k0 = lo(3) + (ic-1)*nzc
         nk = max(0,min(nzc,hi(3)-k0+1))
+        if(is_empty) nk = 0
         if(nk > 0) then
           buf_sp(:,:,1:nk) = real(p(:,:,k0:k0+nk-1),sp)
           offset(:) = [lo(1),lo(2),k0] - 1
@@ -330,32 +355,62 @@ contains
       end do
       deallocate(buf_sp)
     else
-      offset(:) = lo(:) - 1
-      count(:)  = n(:)
-      call h5sselect_hyperslab_f(filespace,H5S_SELECT_SET_F,offset,count,hdferr)
-      call h5screate_simple_f(3,count,memspace,hdferr)
-      call h5dwrite_f(dset,dtype,p,count,hdferr,mem_space_id=memspace,file_space_id=filespace,xfer_prp=plist_id)
+      if(is_empty) then
+        count(:) = 1
+        call h5screate_simple_f(3,count,memspace,hdferr)
+        call h5sselect_none_f(filespace,hdferr)
+        call h5sselect_none_f(memspace ,hdferr)
+        call h5dwrite_f(dset,dtype,dummy_dp,count,hdferr,mem_space_id=memspace,file_space_id=filespace, &
+                        xfer_prp=plist_id)
+      else
+        offset(:) = lo(:) - 1
+        count(:)  = n(:)
+        call h5sselect_hyperslab_f(filespace,H5S_SELECT_SET_F,offset,count,hdferr)
+        call h5screate_simple_f(3,count,memspace,hdferr)
+        call h5dwrite_f(dset,dtype,p,count,hdferr,mem_space_id=memspace,file_space_id=filespace, &
+                        xfer_prp=plist_id)
+      end if
     end if
-    if(hdferr < 0) call abort_run('could not write dataset `fields/'//varname//'` of `'//fname//'`.')
+    if(hdferr < 0) call abort_run('could not write an HDF5 dataset.')
     call h5pclose_f(plist_id,hdferr)
     call h5sclose_f(memspace,hdferr)
     call h5sclose_f(filespace,hdferr)
+  end subroutine h5_write_output_block
+  !
+  subroutine h5_close_output(ids,fname,iprec,time,istep,x,y,z)
+    !
+    ! closes an output file, and writes (task 0) the time and the time step, and the coordinates x, y, z
+    ! of the variable's location (ghost points included), if present
+    !
+    implicit none
+    integer(i8), intent(in), dimension(2) :: ids
+    character(len=*), intent(in) :: fname
+    integer , intent(in) :: iprec
+    real(rp), intent(in) :: time
+    integer , intent(in) :: istep
+    real(rp), intent(in), dimension(0:), optional :: x,y,z
+    integer(HID_T) :: file_id,group_id,dset,dtype
+    integer :: hdferr
+    !
+    dset    = ids(2)
+    file_id = ids(1)
     call h5dclose_f(dset,hdferr)
     call h5fclose_f(file_id,hdferr)
-    !
-    ! metadata
-    !
+    dtype = H5T_NATIVE_DOUBLE
+    if(iprec == 4) dtype = H5T_NATIVE_REAL
     if(myid == 0) then
       call h5fopen_f(fname,H5F_ACC_RDWR_F,file_id,hdferr)
       call h5gcreate_f(file_id,'meta',group_id,hdferr)
       call write_1d(group_id,'time',dtype,[time])
       call write_1d_int(group_id,'istep',[istep])
       call h5gclose_f(group_id,hdferr)
-      call h5gcreate_f(file_id,'grid',group_id,hdferr)
-      call write_1d(group_id,'x',dtype,x)
-      call write_1d(group_id,'y',dtype,y)
-      call write_1d(group_id,'z',dtype,z)
-      call h5gclose_f(group_id,hdferr)
+      if(present(x) .and. present(y) .and. present(z)) then
+        call h5gcreate_f(file_id,'grid',group_id,hdferr)
+        call write_1d(group_id,'x',dtype,x)
+        call write_1d(group_id,'y',dtype,y)
+        call write_1d(group_id,'z',dtype,z)
+        call h5gclose_f(group_id,hdferr)
+      end if
       call h5fclose_f(file_id,hdferr)
     end if
     call h5close_f(hdferr)
@@ -394,7 +449,7 @@ contains
       call h5dclose_f(dset,hdferr)
       call h5sclose_f(space,hdferr)
     end subroutine write_1d_int
-  end subroutine h5_write_field
+  end subroutine h5_close_output
   !
   subroutine h5_read_grid(fname,n,istat,iprec,xc,xf)
     !

@@ -11,11 +11,24 @@ module mod_io
   use mod_common , only: rp,sp,dp,i8,myid,ierr,abort_run,CHUNK_BYTES,runs_1d
   use mod_io_hdf5, only: MSG_NO_HDF5
 #if defined(_USE_HDF5)
-  use mod_io_hdf5, only: h5_get_field_layout,h5_read_fldinfo,h5_read_block,h5_write_field
+  use mod_io_hdf5, only: h5_get_field_layout,h5_read_fldinfo,h5_read_block,h5_open_output,h5_write_output_block, &
+                         h5_close_output
 #endif
   implicit none
   private
-  public get_checkpoint_layout,read_fldinfo,read_block,write_field
+  public get_checkpoint_layout,read_fldinfo,read_block,write_field,out_file,open_output,write_output_block, &
+         close_output
+  !
+  ! an output checkpoint file, open for writing a field by blocks (`open_output`, `write_output_block`,
+  ! `close_output`)
+  !
+  type out_file
+    character(len=:), allocatable :: fname,fmt,varname
+    integer :: iprec
+    integer(MPI_OFFSET_KIND) :: disp,disp_info ! MPI-IO: byte offsets of the field and of the time and time step
+    type(MPI_FILE) :: fh
+    integer(i8), dimension(2) :: h5_ids        ! HDF5: file and dataset identifiers
+  end type out_file
 contains
   subroutine get_checkpoint_layout(fname,fmt,varname,ng,iprec,nfields)
     !
@@ -270,6 +283,7 @@ contains
     logical, dimension(n) :: is_read
     integer, dimension(n) :: rank
     integer :: i,ig,nruns
+    logical :: is_prev
     !
     ifile(:) = 0
     is_read(:) = .false.
@@ -288,18 +302,17 @@ contains
     runs%n = nruns
     allocate(runs%start(nruns),runs%length(nruns))
     nruns = 0
+    is_prev = .false.
     do i=1,n
-      if(.not.is_read(i)) cycle
-      if(i == 1) then
-        nruns = nruns + 1
-        runs%start(nruns) = i
-        runs%length(nruns) = 0
-      else if(.not.is_read(i-1)) then
-        nruns = nruns + 1
-        runs%start(nruns) = i
-        runs%length(nruns) = 0
+      if(is_read(i)) then
+        if(.not.is_prev) then
+          nruns = nruns + 1
+          runs%start(nruns)  = i
+          runs%length(nruns) = 0
+        end if
+        runs%length(nruns) = runs%length(nruns) + 1
       end if
-      runs%length(nruns) = runs%length(nruns) + 1
+      is_prev = is_read(i)
     end do
     rank(:) = 0
     nruns = 0
@@ -316,10 +329,9 @@ contains
   subroutine write_field(fname,fmt,varname,ng,lo,hi,iprec,p,time,istep,x,y,z,is_compress)
     !
     ! writes a per-variable checkpoint file (the field, then the time and the time step; MPI-IO or HDF5) in
-    ! single or double precision (iprec = 4 or 8 bytes); each task writes its block
-    ! p(lo(1):hi(1),lo(2):hi(2),lo(3):hi(3)), converted to single precision by chunks of planes
-    ! (`CHUNK_BYTES`) if needed; HDF5 files also hold the coordinates x, y, z of the variable's location,
-    ! and can be compressed
+    ! single or double precision (iprec = 4 or 8 bytes), from the block p(lo(1):hi(1),...) of each task;
+    ! HDF5 files also hold the coordinates x, y, z of the variable's location, and can be compressed, in
+    ! chunks based on the smallest block of the tasks
     !
     implicit none
     character(len=*), intent(in) :: fname,fmt,varname
@@ -330,73 +342,164 @@ contains
     integer , intent(in) :: istep
     real(rp), intent(in), dimension(0:) :: x,y,z
     logical , intent(in) :: is_compress
-    real(sp), allocatable, dimension(:,:,:) :: buf_sp
-    real(sp), dimension(2) :: fldinfo_sp
-    real(dp), dimension(2) :: fldinfo
-    type(MPI_DATATYPE) :: etype,type_glob,type_loc
-    type(MPI_FILE) :: fh
-    integer(MPI_OFFSET_KIND) :: disp
-    integer , dimension(3) :: n
-    integer :: nreals_myid,nzc,nchunks,ic,k0,nk
+    type(out_file) :: f
+    integer, dimension(3) :: nchunk
     !
+    call MPI_ALLREDUCE(hi-lo+1,nchunk,3,MPI_INTEGER,MPI_MIN,MPI_COMM_WORLD,ierr)
+    call open_output(fname,fmt,varname,ng,iprec,f,is_compress=is_compress,nchunk=nchunk)
+    call write_output_block(f,ng,lo,hi,p)
+    call close_output(f,time,istep,x,y,z)
+  end subroutine write_field
+  !
+  subroutine open_output(fname,fmt,varname,ng,iprec,f,is_compress,nchunk,disp,disp_info,is_existing)
+    !
+    ! opens an output checkpoint file f for writing a field of ng points by blocks, in single or double
+    ! precision (iprec = 4 or 8 bytes): an MPI-IO file with the field at byte offset disp (default: 0) and
+    ! the time and the time step at byte offset disp_info (default: after the field), created unless
+    ! is_existing; or an HDF5 file with dataset `fields/<varname>`, compressed if is_compress, in chunks
+    ! based on blocks of nchunk points
+    !
+    implicit none
+    character(len=*), intent(in) :: fname,fmt,varname
+    integer , intent(in), dimension(3) :: ng
+    integer , intent(in) :: iprec
+    type(out_file), intent(out) :: f
+    logical , intent(in), optional :: is_compress
+    integer , intent(in), dimension(3), optional :: nchunk
+    integer(MPI_OFFSET_KIND), intent(in), optional :: disp,disp_info
+    logical , intent(in), optional :: is_existing
+    logical :: is_existing_
+    !
+    f%fname   = fname
+    f%fmt     = fmt
+    f%varname = varname
+    f%iprec   = iprec
     if(fmt == 'hdf5') then
 #if defined(_USE_HDF5)
-      call h5_write_field(fname,varname,ng,lo,hi,iprec,p,time,istep,x,y,z,is_compress)
+      call h5_open_output(fname,varname,ng,iprec,is_compress,nchunk,f%h5_ids)
 #else
-      associate(dummy_varname => varname,dummy_x => x,dummy_y => y,dummy_z => z,dummy_is_compress => is_compress)
-      end associate
+      if(present(is_compress) .or. present(nchunk)) continue ! (arguments only used with HDF5)
       call abort_run(MSG_NO_HDF5)
 #endif
       return
     end if
-    n(:) = hi(:)-lo(:)+1
-    if(iprec == 4) then
+    f%disp = 0
+    if(present(disp)) f%disp = disp
+    f%disp_info = f%disp + product(int(ng(:),MPI_OFFSET_KIND))*iprec
+    if(present(disp_info)) f%disp_info = disp_info
+    is_existing_ = .false.
+    if(present(is_existing)) is_existing_ = is_existing
+    if(is_existing_) then
+      call MPI_FILE_OPEN(MPI_COMM_WORLD,fname,MPI_MODE_WRONLY,MPI_INFO_NULL,f%fh,ierr)
+      if(ierr /= MPI_SUCCESS) call abort_run('could not open output file `'//fname//'`.')
+    else
+      call MPI_FILE_OPEN(MPI_COMM_WORLD,fname,MPI_MODE_CREATE+MPI_MODE_WRONLY,MPI_INFO_NULL,f%fh,ierr)
+      if(ierr /= MPI_SUCCESS) call abort_run('could not create output file `'//fname//'`.')
+      call MPI_FILE_SET_SIZE(f%fh,0_MPI_OFFSET_KIND,ierr)
+    end if
+  end subroutine open_output
+  !
+  subroutine write_output_block(f,ng,lo,hi,p)
+    !
+    ! writes the block p(lo(1):hi(1),lo(2):hi(2),lo(3):hi(3)) of each task (none if hi < lo) to an output
+    ! file, converted to single precision by chunks of planes (`CHUNK_BYTES`) if needed; collective
+    !
+    implicit none
+    type(out_file), intent(inout) :: f
+    integer , intent(in), dimension(3) :: ng,lo,hi
+    real(rp), intent(in), contiguous, dimension(lo(1):,lo(2):,lo(3):) :: p
+    real(sp), allocatable, dimension(:,:,:) :: buf_sp
+    type(MPI_DATATYPE) :: etype,type_glob,type_loc
+    integer , dimension(3) :: n
+    integer :: nzc,nchunks,ic,k0,nk
+    logical :: is_empty
+    !
+    if(f%fmt == 'hdf5') then
+#if defined(_USE_HDF5)
+      call h5_write_output_block(f%h5_ids,f%iprec,lo,hi,p)
+#endif
+      return
+    end if
+    n(:) = max(hi(:)-lo(:)+1,0)
+    is_empty = any(n(:) == 0)
+    if(f%iprec == 4) then
       etype = MPI_REAL
     else
       etype = MPI_DOUBLE_PRECISION
     end if
-    call MPI_TYPE_CREATE_SUBARRAY(3,ng,n,lo-1,MPI_ORDER_FORTRAN,etype,type_glob,ierr)
-    call MPI_TYPE_COMMIT(type_glob,ierr)
-    call MPI_TYPE_CONTIGUOUS(n(1)*n(2),etype,type_loc,ierr)
+    if(is_empty) then
+      call MPI_FILE_SET_VIEW(f%fh,f%disp,etype,etype,'native',MPI_INFO_NULL,ierr)
+      call MPI_TYPE_CONTIGUOUS(1,etype,type_loc,ierr)
+    else
+      call MPI_TYPE_CREATE_SUBARRAY(3,ng,n,lo-1,MPI_ORDER_FORTRAN,etype,type_glob,ierr)
+      call MPI_TYPE_COMMIT(type_glob,ierr)
+      call MPI_FILE_SET_VIEW(f%fh,f%disp,etype,type_glob,'native',MPI_INFO_NULL,ierr)
+      call MPI_TYPE_FREE(type_glob,ierr)
+      call MPI_TYPE_CONTIGUOUS(n(1)*n(2),etype,type_loc,ierr)
+    end if
     call MPI_TYPE_COMMIT(type_loc,ierr)
-    !
-    call MPI_FILE_OPEN(MPI_COMM_WORLD,fname,MPI_MODE_CREATE+MPI_MODE_WRONLY,MPI_INFO_NULL,fh,ierr)
-    if(ierr /= MPI_SUCCESS) call abort_run('could not create output file `'//fname//'`.')
-    call MPI_FILE_SET_SIZE(fh,0_MPI_OFFSET_KIND,ierr)
-    call MPI_FILE_SET_VIEW(fh,0_MPI_OFFSET_KIND,etype,type_glob,'native',MPI_INFO_NULL,ierr)
-    if(iprec == 4) then
+    if(f%iprec == 4) then
       !
       ! convert and write in chunks of nzc planes, so that the single-precision copy stays small;
       ! the file pointer advances within the view, and all tasks make the same number of
       ! collective calls (with no data once their block is written)
       !
-      nzc = int(max(1_i8,min(int(n(3),i8),CHUNK_BYTES/(4*int(n(1),i8)*n(2)))))
+      nzc = 1
+      if(.not.is_empty) nzc = int(max(1_i8,min(int(n(3),i8),CHUNK_BYTES/(4*int(n(1),i8)*n(2)))))
       nchunks = (n(3)+nzc-1)/nzc
       call MPI_ALLREDUCE(MPI_IN_PLACE,nchunks,1,MPI_INTEGER,MPI_MAX,MPI_COMM_WORLD,ierr)
       allocate(buf_sp(n(1),n(2),nzc))
       do ic=1,nchunks
         k0 = lo(3) + (ic-1)*nzc
         nk = max(0,min(nzc,hi(3)-k0+1))
+        if(is_empty) nk = 0
         if(nk > 0) buf_sp(:,:,1:nk) = real(p(:,:,k0:k0+nk-1),sp)
-        call MPI_FILE_WRITE_ALL(fh,buf_sp,nk,type_loc,MPI_STATUS_IGNORE,ierr)
+        call MPI_FILE_WRITE_ALL(f%fh,buf_sp,nk,type_loc,MPI_STATUS_IGNORE,ierr)
       end do
       deallocate(buf_sp)
     else
-      call MPI_FILE_WRITE_ALL(fh,p     ,n(3),type_loc,MPI_STATUS_IGNORE,ierr)
+      call MPI_FILE_WRITE_ALL(f%fh,p,n(3),type_loc,MPI_STATUS_IGNORE,ierr)
     end if
-    disp = product(int(ng(:),MPI_OFFSET_KIND))*iprec
-    call MPI_FILE_SET_VIEW(fh,disp,etype,etype,'native',MPI_INFO_NULL,ierr)
+    call MPI_TYPE_FREE(type_loc,ierr)
+  end subroutine write_output_block
+  !
+  subroutine close_output(f,time,istep,x,y,z)
+    !
+    ! writes the time and the time step (and, for HDF5 files, the coordinates x, y, z of the variable's
+    ! location, if present), and closes an output file
+    !
+    implicit none
+    type(out_file), intent(inout) :: f
+    real(rp), intent(in) :: time
+    integer , intent(in) :: istep
+    real(rp), intent(in), dimension(0:), optional :: x,y,z
+    real(sp), dimension(2) :: fldinfo_sp
+    real(dp), dimension(2) :: fldinfo
+    type(MPI_DATATYPE) :: etype
+    integer :: nreals_myid
+    !
+    if(f%fmt == 'hdf5') then
+#if defined(_USE_HDF5)
+      call h5_close_output(f%h5_ids,f%fname,f%iprec,time,istep,x,y,z)
+#endif
+      return
+    end if
+    if(present(x) .or. present(y) .or. present(z)) continue ! (coordinates only written to HDF5 files)
+    if(f%iprec == 4) then
+      etype = MPI_REAL
+    else
+      etype = MPI_DOUBLE_PRECISION
+    end if
+    call MPI_FILE_SET_VIEW(f%fh,f%disp_info,etype,etype,'native',MPI_INFO_NULL,ierr)
     fldinfo(:) = [time,1._rp*istep]
     fldinfo_sp(:) = real(fldinfo(:),sp)
     nreals_myid = 0
     if(myid == 0) nreals_myid = 2
-    if(iprec == 4) then
-      call MPI_FILE_WRITE(fh,fldinfo_sp,nreals_myid,etype,MPI_STATUS_IGNORE,ierr)
+    if(f%iprec == 4) then
+      call MPI_FILE_WRITE(f%fh,fldinfo_sp,nreals_myid,etype,MPI_STATUS_IGNORE,ierr)
     else
-      call MPI_FILE_WRITE(fh,fldinfo   ,nreals_myid,etype,MPI_STATUS_IGNORE,ierr)
+      call MPI_FILE_WRITE(f%fh,fldinfo   ,nreals_myid,etype,MPI_STATUS_IGNORE,ierr)
     end if
-    call MPI_FILE_CLOSE(fh,ierr)
-    call MPI_TYPE_FREE(type_glob,ierr)
-    call MPI_TYPE_FREE(type_loc ,ierr)
-  end subroutine write_field
+    call MPI_FILE_CLOSE(f%fh,ierr)
+  end subroutine close_output
 end module mod_io
