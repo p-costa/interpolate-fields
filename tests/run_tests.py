@@ -7,7 +7,7 @@ Each test writes CaNS-format grid and checkpoint files, runs the program with se
 and checks the output: identity on the same grid, exactness for linear fields, process-grid independence,
 precision conversion, legacy and per-variable input, variables on edges and corners, a comparison with an
 independent NumPy implementation, field operations (mean removal, offsets, frame change), periodic tiling,
-HDF5 input and output (with h5py, if the program is built with HDF5;
+merging and splitting per-task checkpoints (`task-checkpoints`), HDF5 input and output (with h5py, if the program is built with HDF5;
 otherwise, the error message), and the input checks. The MPI launcher is taken from the environment
 variable MPIRUN (default: 'mpirun --oversubscribe').
 """
@@ -177,10 +177,10 @@ def namelist(groups):
     return '\n'.join(out) + '\n'
 
 
-def run(workdir, nml, nproc=1, expect_fail=False):
+def run(workdir, nml, nproc=1, expect_fail=False, exe=None):
     with open(os.path.join(workdir, 'interp.nml'), 'w') as f:
         f.write(nml)
-    cmd = MPIRUN + ['-n', str(nproc), EXE]
+    cmd = MPIRUN + ['-n', str(nproc), exe or EXE, 'interp.nml']
     r = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True)
     if expect_fail:
         assert r.returncode != 0, 'the run was expected to fail:\n' + r.stdout
@@ -890,19 +890,164 @@ def test_tiling(workdir):
     print(f'  tiling: {len(checks) + 2} invalid inputs stop with a message')
 
 
+def task_blocks(ng, dims, order):
+    """blocks (0-based [start, end) per direction) of the ranks of a dims decomposition, in rank order"""
+    def dist(n, d):
+        sz = [n//d + (1 if c < n % d else 0) for c in range(d)]
+        st = np.concatenate([[0], np.cumsum(sz)])
+        return [(st[c], st[c+1]) for c in range(d)]
+    dd = [dist(ng[i], dims[i]) for i in range(3)]
+    out = []
+    for r in range(int(np.prod(dims))):
+        if order == 'column-major':
+            c = (r % dims[0], (r//dims[0]) % dims[1], r//(dims[0]*dims[1]))
+        else:
+            c = (r//(dims[1]*dims[2]), (r//dims[2]) % dims[1], r % dims[2])
+        out.append([dd[i][c[i]] for i in range(3)])
+    return out
+
+
+def block(a, b):
+    return a[b[0][0]:b[0][1], b[1][0]:b[1][1], b[2][0]:b[2][1]]
+
+
+def write_task_files(workdir, prefix, fields, dims, order, dtype, times=None, steps=None):
+    """per-task files: the blocks of the fields, one after the other, then the time and the time step"""
+    for r, b in enumerate(task_blocks(fields[0].shape, dims, order)):
+        with open(os.path.join(workdir, f'{prefix}{r:05d}.bin'), 'wb') as f:
+            for a in fields:
+                f.write(np.asarray(block(a, b), dtype=dtype).tobytes(order='F'))
+            f.write(np.array([times[r] if times else 1.5, steps[r] if steps else 100], dtype=dtype).tobytes())
+
+
+def run_tasks(workdir, entries, nproc, expect_fail=False):
+    nml = namelist([('tasks', entries)])
+    return run(workdir, nml, nproc, expect_fail, exe=EXE_TASKS)
+
+
+def test_tasks(workdir):
+    """merging per-task checkpoints and splitting checkpoints into per-task files"""
+    ng = (11, 9, 7)
+    rng = np.random.default_rng(5)
+    names = ['u', 'v', 'w', 'p', 's_001']
+    fields = [rng.standard_normal(ng) for _ in names]
+    base = {'ng(1:3)': list(ng), 'task_prefix': 'fld_myid_', 'task_variables': names}
+    # merge: pencil and 3D decompositions, both rank orders, any number of tasks of this program
+    layouts = [((1, 3, 2), 'row-major', 4), ((1, 3, 2), 'column-major', 1), ((2, 2, 3), 'row-major', 5),
+               ((4, 1, 1), 'column-major', 3), ((3, 3, 1), 'row-major', 12)]
+    for dims, order, nproc in layouts:
+        for dtype in [np.float64, np.float32]:
+            write_task_files(workdir, 'fld_myid_', fields, dims, order, dtype)
+            run_tasks(workdir, {**base, 'mode': 'merge', 'task_dims(1:3)': list(dims), 'task_order': order,
+                                'checkpoint_prefix': 'fld'}, nproc)
+            for n, a in zip(names, fields):
+                out, info = read_field(os.path.join(workdir, f'fld_{n}.bin'), ng, dtype)
+                assert np.array_equal(out, a.astype(dtype)) and np.array_equal(info, [1.5, 100]), (dims, order, n)
+    print(f'  merge: exact for {len(layouts)} decompositions (pencils and 3D, both rank orders), single and '
+          'double precision, 1 to 12 tasks')
+    # precision conversion, legacy output, offset, and merging a subset into an existing output
+    dims, order = (1, 3, 2), 'row-major'
+    big = fields[3] + 949381.
+    write_task_files(workdir, 'fld_myid_', fields[:3] + [big] + fields[4:], dims, order, np.float64)
+    tasks = {**base, 'mode': 'merge', 'task_dims(1:3)': list(dims), 'task_order': order}
+    run_tasks(workdir, {**tasks, 'checkpoint_format': 'legacy', 'checkpoint_file': 'fld_legacy.bin',
+                        'checkpoint_precision': 'single'}, 4)
+    raw = np.fromfile(os.path.join(workdir, 'fld_legacy.bin'), dtype=np.float32)
+    nt = int(np.prod(ng))
+    assert raw.size == len(names)*nt + 2
+    assert np.array_equal(raw[3*nt:4*nt].reshape(ng, order='F'), big.astype(np.float32))
+    run_tasks(workdir, {**tasks, 'checkpoint_format': 'legacy', 'checkpoint_file': 'fld_legacy.bin',
+                        'checkpoint_precision': 'single', 'variables': ['p'], 'offset(4)': 949381.}, 3)
+    raw2 = np.fromfile(os.path.join(workdir, 'fld_legacy.bin'), dtype=np.float32)
+    p = raw2[3*nt:4*nt].reshape(ng, order='F')
+    assert np.array_equal(p, (big - 949381.).astype(np.float32)), 'offset not subtracted in double precision'
+    assert np.array_equal(np.delete(raw2, np.s_[3*nt:4*nt]), np.delete(raw, np.s_[3*nt:4*nt])), \
+        'merging p changed the other fields'
+    assert np.abs(p - fields[3]).max() < 1e-6, 'the field minus the offset is not resolved in single precision'
+    run_tasks(workdir, {**tasks, 'checkpoint_prefix': 'fld', 'variables': ['p'], 'offset(4)': 949381.}, 2)
+    out, _ = read_field(os.path.join(workdir, 'fld_p.bin'), ng)
+    assert np.array_equal(out, big - 949381.)
+    out = run_tasks(workdir, {**tasks, 'checkpoint_format': 'legacy', 'checkpoint_file': 'none.bin',
+                              'variables': ['p']}, 2, expect_fail=True)
+    assert 'requires an existing, complete file' in out, out
+    print('  merge: legacy single-file output, offset (subtracted in double precision), and one field merged '
+          'again into an existing output (the others unchanged)')
+    # inconsistent times: a warning, and the time of rank 0; inconsistent steps: an error
+    nf = int(np.prod(dims))
+    write_task_files(workdir, 'fld_myid_', fields, dims, order, np.float64, times=[1.5]*(nf-1) + [1.75])
+    out = run_tasks(workdir, {**tasks, 'checkpoint_prefix': 'fld'}, 4)
+    assert 'WARNING: inconsistent time' in out, out
+    assert np.array_equal(read_field(os.path.join(workdir, 'fld_u.bin'), ng)[1], [1.5, 100])
+    write_task_files(workdir, 'fld_myid_', fields, dims, order, np.float64, steps=[100]*(nf-1) + [101])
+    out = run_tasks(workdir, {**tasks, 'checkpoint_prefix': 'fld'}, 4, expect_fail=True)
+    assert 'inconsistent time step' in out, out
+    write_task_files(workdir, 'fld_myid_', fields[:4], dims, order, np.float64)
+    out = run_tasks(workdir, {**tasks, 'checkpoint_prefix': 'fld'}, 4, expect_fail=True)
+    assert 'is not that of rank' in out, out
+    print('  merge: inconsistent times give a warning, inconsistent steps and wrong file sizes an error')
+    # the merged output, read by the main program, as the same data written directly
+    gi = [uniform(ng[0], 1.), uniform(ng[1], 1.), uniform(ng[2], 1.)]
+    go = [uniform(14, 1.), uniform(10, 1.), uniform(9, 1.)]
+    cbc, bc = {n: [['P', 'P']]*3 for n in names}, {n: [[0, 0]]*3 for n in names}
+    write_task_files(workdir, 'fld_myid_', fields, dims, order, np.float64)
+    run_tasks(workdir, {**tasks, 'checkpoint_prefix': 'fld_i'}, 4)
+    nml = case_nml(gi, go, ['']*3, ['']*3, names, cbc, bc, {}, extra={'output_prefix': 'fld_m'})
+    run(workdir, nml, 3)
+    for n, a in zip(names, fields):
+        write_field(os.path.join(workdir, f'fld_i_{n}.bin'), a)
+    nml = case_nml(gi, go, ['']*3, ['']*3, names, cbc, bc, {}, extra={'output_prefix': 'fld_d'})
+    run(workdir, nml, 3)
+    for n in names:
+        a = np.fromfile(os.path.join(workdir, f'fld_m_{n}.bin'))
+        b = np.fromfile(os.path.join(workdir, f'fld_d_{n}.bin'))
+        assert a.tobytes() == b.tobytes(), n
+    print('  merge: the merged checkpoint gives the same interpolation as the checkpoint written directly')
+    # split: per-task files of any decomposition, then merged back; from per-variable, legacy and HDF5 files
+    formats = [('per-variable', 'fld_s', None)]
+    write_legacy(os.path.join(workdir, 'fld_s_legacy.bin'), fields)
+    formats.append(('legacy', None, 'fld_s_legacy.bin'))
+    if h5py is not None and hdf5_enabled(workdir):
+        for n, a in zip(names, fields):
+            write_field_h5(os.path.join(workdir, f'fld_s_{n}.h5'), n, a)
+        formats.append(('hdf5', 'fld_s', None))
+    for n, a in zip(names, fields):
+        write_field(os.path.join(workdir, f'fld_s_{n}.bin'), a)
+    for (dims, order, nproc), (fmt_c, prefix, file) in zip(layouts, formats*len(layouts)):
+        for prec, dtype in [('input', np.float64), ('single', np.float32)]:
+            ck = {'checkpoint_format': fmt_c, **({'checkpoint_prefix': prefix} if prefix else {}),
+                  **({'checkpoint_file': file} if file else {})}
+            run_tasks(workdir, {**base, 'mode': 'split', 'task_dims(1:3)': list(dims), 'task_order': order,
+                                'task_prefix': 'split_', 'task_precision': prec, **ck}, nproc)
+            for r, b in enumerate(task_blocks(ng, dims, order)):
+                raw = np.fromfile(os.path.join(workdir, f'split_{r:05d}.bin'), dtype=dtype)
+                ref = np.concatenate([block(a, b).astype(dtype).ravel(order='F') for a in fields] +
+                                     [np.array([1.5, 100], dtype=dtype)])
+                assert np.array_equal(raw, ref), (dims, order, fmt_c, r)
+            run_tasks(workdir, {**base, 'mode': 'merge', 'task_dims(1:3)': list(dims), 'task_order': order,
+                                'task_prefix': 'split_', 'checkpoint_prefix': 'back'}, nproc)
+            for n, a in zip(names, fields):
+                assert np.array_equal(read_field(os.path.join(workdir, f'back_{n}.bin'), ng, dtype)[0],
+                                      a.astype(dtype)), (dims, n)
+    print(f'  split: exact per-task files for {len(layouts)} decompositions, from {", ".join(f[0] for f in formats)} '
+          'checkpoints, in single and double precision; merged back exactly')
+
+
 TESTS = {'identity': test_identity, 'linear': test_linear, 'layouts': test_layouts, 'precision': test_precision,
          'formats': test_formats, 'defaults': test_defaults, 'hdf5': test_hdf5, 'operations': test_operations,
-         'tiling': test_tiling, 'errors': test_input_errors}
+         'tiling': test_tiling, 'tasks': test_tasks, 'errors': test_input_errors}
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--exe', default=os.path.join(ROOT, 'exe', 'interpit'))
+    parser.add_argument('--exe-tasks', default=None,
+                        help='task-checkpoints executable (default: `task-checkpoints` next to --exe)')
     parser.add_argument('--workdir', default=None, help='directory for the test files (default: a temporary one)')
     parser.add_argument('--keep', action='store_true', help='keep the test files')
     parser.add_argument('tests', nargs='*', default=list(TESTS))
     args = parser.parse_args()
     EXE = os.path.abspath(args.exe)
+    EXE_TASKS = os.path.abspath(args.exe_tasks or os.path.join(os.path.dirname(EXE), 'task-checkpoints'))
     base = tempfile.mkdtemp(prefix='interpit-tests-', dir=args.workdir)
     nfail = 0
     try:
@@ -912,9 +1057,9 @@ if __name__ == '__main__':
             print(f'{name}:', flush=True)
             try:
                 TESTS[name](wd)
-            except (AssertionError, RuntimeError) as e:
+            except Exception as e:
                 nfail += 1
-                print(f'  FAILED: {e}')
+                print(f'  FAILED: {type(e).__name__}: {e}')
     finally:
         if args.keep:
             print(f'test files kept in {base}')
