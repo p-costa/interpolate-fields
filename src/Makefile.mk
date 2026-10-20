@@ -72,6 +72,7 @@ $(EXE): $(LIB_OBJS) $(APP_DIR)/interpolate-fields.f90.o
 	$(FC) $(FFLAGS) $^ $(LIBS) -o $@
 
 $(EXE_TASKS): $(LIB_OBJS) $(APP_DIR)/task-checkpoints.f90.o
+	mkdir -p $(EXE_DIR)
 	$(FC) $(FFLAGS) $^ $(LIBS) -o $@
 
 # Create object files from Fortran source
