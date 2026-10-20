@@ -2,15 +2,17 @@ module mod_param
   !
   ! input parameters, read from a namelist file (see the README)
   !
-  use mod_common , only: rp,myid,abort_run
+  use mod_common , only: rp,i8,myid,abort_run
   use mod_io_hdf5, only: is_hdf5_enabled,is_hdf5_file
   implicit none
   private
-  public read_input,var_t,input_file_name,output_file_name
+  public read_input,var_t,input_file_name,output_file_name,MAX_TILES
   public dims,input_format,input_prefix,input_file,output_format,output_prefix,output_precision, &
-         is_compress_output,is_reset_time,ng_i,l_i,grid_files_i,ng_o,l_o,grid_files_o,is_periodic,vars
+         is_compress_output,is_reset_time,ng_i,l_i,grid_files_i,ng_o,l_o,grid_files_o,is_periodic,vars, &
+         ntiles,ntiles_tot,tile_inputs,tile_shifts
   integer, parameter :: MAX_VARS = 128, & ! maximum number of variables processed
-                        MAX_SCAL = 999    ! maximum number of scalars, `s_001` to `s_999`, as in CaNS
+                        MAX_SCAL = 999, & ! maximum number of scalars, `s_001` to `s_999`, as in CaNS
+                        MAX_TILES = 256   ! maximum number of tiles
   integer, parameter :: LEN_NAME = 32, LEN_FILE = 256
   !
   ! a variable to process: name, location (staggered, i.e. on the cell faces, or cell-centred, per
@@ -45,6 +47,14 @@ module mod_param
   !
   logical                , protected, dimension(3) :: is_periodic
   type(var_t), allocatable, protected, dimension(:) :: vars
+  !
+  ! &tiling: number of tiles per direction, and the input (prefix, or legacy file) and the shift (in input
+  ! cells) of each tile, x fastest
+  !
+  integer                , protected, dimension(3) :: ntiles
+  integer                , protected :: ntiles_tot
+  character(len=LEN_FILE), protected, dimension(MAX_TILES) :: tile_inputs
+  integer                , protected, dimension(3,MAX_TILES) :: tile_shifts
 contains
   subroutine read_input(fname)
     implicit none
@@ -72,6 +82,7 @@ contains
     call read_nml_bc(iunit,fname,cbcvel,bcvel,cbcpre,bcpre,cbcscal,bcscal)
     call read_nml_variables(iunit,fname,nvars_nml,vars_nml)
     call read_nml_operations(iunit,fname,is_remove_mean,offset,vel_frame)
+    call read_nml_tiling(iunit,fname)
     close(iunit)
     !
     ! &interp
@@ -180,28 +191,52 @@ contains
         print*, 'WARNING: `&variable` group of `', trim(vars_nml(jv)%name), '` ignored (not in `variables`).'
     end do
     !
+    ! tiling, along periodic directions only; shifts along uniform directions only, as whole-cell shifts
+    ! of a non-uniform grid would move the values to cells of other sizes
+    !
+    if(any(ntiles(:) < 1)) call abort_run('`ntiles` must be positive.')
+    if(any(ntiles(:) > 1 .and. .not.is_periodic(:))) &
+      call abort_run('tiling (`ntiles` > 1) is only possible along periodic directions.')
+    if(product(int(ntiles(:),i8)) > MAX_TILES) call abort_run('too many tiles.')
+    ntiles_tot = product(ntiles(:))
+    if(any(tile_inputs(ntiles_tot+1:) /= '') .or. any(tile_shifts(:,ntiles_tot+1:) /= 0)) &
+      call abort_run('`tile_inputs` or `tile_shifts` set beyond the number of tiles.')
+    do iv=1,3
+      if(any(tile_shifts(iv,1:ntiles_tot) /= 0) .and. .not.is_periodic(iv)) &
+        call abort_run('tile shifts are only possible along periodic directions.')
+      if(any(tile_shifts(iv,1:ntiles_tot) /= 0) .and. len_trim(grid_files_i(iv)) > 0) &
+        call abort_run('tile shifts are only possible along directions with a uniform input grid.')
+    end do
+    where(tile_inputs(1:ntiles_tot) == '')
+      tile_inputs(1:ntiles_tot) = merge(input_file,input_prefix,trim(input_format) == 'legacy')
+    end where
+    !
     ! the output must not overwrite the input
     !
     do iv=1,nvars
-      if(input_file_name(vars(iv)%name) == output_file_name(vars(iv)%name)) &
-        call abort_run('the output file of variable `'//trim(vars(iv)%name)//'` would overwrite its input.')
+      do jv=1,ntiles_tot
+        if(input_file_name(vars(iv)%name,jv) == output_file_name(vars(iv)%name)) &
+          call abort_run('the output file of variable `'//trim(vars(iv)%name)//'` would overwrite its input.')
+      end do
     end do
   end subroutine read_input
   !
-  function input_file_name(name) result(fname)
+  function input_file_name(name,itile) result(fname)
     !
-    ! input file of variable `name`: `<input_prefix>_<name>.bin` or `.h5`, or the legacy `input_file`
+    ! input file of variable `name` for tile `itile`: `<prefix>_<name>.bin` or `.h5`, or a legacy file,
+    ! with the prefix or file of the tile (by default, `input_prefix` or `input_file`)
     !
     implicit none
     character(len=*), intent(in) :: name
+    integer         , intent(in) :: itile
     character(len=:), allocatable :: fname
     select case(trim(input_format))
     case('legacy')
-      fname = trim(input_file)
+      fname = trim(tile_inputs(itile))
     case('hdf5')
-      fname = trim(input_prefix)//'_'//trim(name)//'.h5'
+      fname = trim(tile_inputs(itile))//'_'//trim(name)//'.h5'
     case default
-      fname = trim(input_prefix)//'_'//trim(name)//'.bin'
+      fname = trim(tile_inputs(itile))//'_'//trim(name)//'.bin'
     end select
   end function input_file_name
   !
@@ -370,6 +405,25 @@ contains
     read(iunit,nml=operations,iostat=istat,iomsg=errmsg)
     if(istat > 0) call abort_run('could not read namelist `&operations` from `'//fname//'`: '//trim(errmsg))
   end subroutine read_nml_operations
+  !
+  subroutine read_nml_tiling(iunit,fname)
+    !
+    ! reads `&tiling` (optional)
+    !
+    implicit none
+    integer         , intent(in) :: iunit
+    character(len=*), intent(in) :: fname
+    integer :: istat
+    character(len=256) :: errmsg
+    namelist /tiling/ ntiles,tile_inputs,tile_shifts
+    !
+    ntiles(:)        = 1
+    tile_inputs(:)   = ''
+    tile_shifts(:,:) = 0
+    rewind(iunit)
+    read(iunit,nml=tiling,iostat=istat,iomsg=errmsg)
+    if(istat > 0) call abort_run('could not read namelist `&tiling` from `'//fname//'`: '//trim(errmsg))
+  end subroutine read_nml_tiling
   !
   logical function is_scalar_name(name,iscal)
     !

@@ -12,6 +12,13 @@ module mod_common
   integer(i8), parameter :: CHUNK_BYTES = 64*2_i8**20 ! size of the conversion buffer for single-precision output
   integer :: ierr
   integer :: myid = 0
+  !
+  ! runs of consecutive indices to read along one direction of a file: start(1:n), length(1:n)
+  !
+  type runs_1d
+    integer :: n = 0
+    integer, allocatable, dimension(:) :: start,length
+  end type runs_1d
 contains
   subroutine abort_run(msg)
     !

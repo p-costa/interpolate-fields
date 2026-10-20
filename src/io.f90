@@ -8,7 +8,7 @@ module mod_io
   !   'hdf5'        : HDF5 files with one field each (see `mod_io_hdf5`)
   !
   use mpi_f08
-  use mod_common , only: rp,sp,dp,i8,myid,ierr,abort_run,CHUNK_BYTES
+  use mod_common , only: rp,sp,dp,i8,myid,ierr,abort_run,CHUNK_BYTES,runs_1d
   use mod_io_hdf5, only: MSG_NO_HDF5
 #if defined(_USE_HDF5)
   use mod_io_hdf5, only: h5_get_field_layout,h5_read_fldinfo,h5_read_block,h5_write_field
@@ -113,105 +113,129 @@ contains
     istep = nint(fldinfo(2))
   end subroutine read_fldinfo
   !
-  subroutine read_block(fname,fmt,varname,disp,ng,iprec,is_periodic,lo,hi,p)
+  subroutine read_block(fnames,fmt,varname,disps,ng,nt,shifts,iprec,is_periodic,lo,hi,p)
     !
-    ! reads the points lo:hi of a field (stored at byte offset disp of an MPI-IO file, or in dataset
-    ! `fields/<varname>` of an HDF5 file) into p, indexed as the global grid; along periodic directions,
-    ! the indices outside 1:ng wrap around, and along the other directions they are ghost points, which are
-    ! not read; the points to read form at most two runs of indices per direction, in increasing order,
-    ! selected by the file view (MPI-IO) or by a union of hyperslabs (HDF5), and all tasks read their blocks
-    ! with one collective call
+    ! reads the points lo:hi of the input field into p, indexed as the global grid; the input domain is
+    ! made of nt(1) x nt(2) x nt(3) tiles (x fastest), each the field of one file, fnames(it), of ng points
+    ! (stored at byte offset disps(it) of an MPI-IO file, or in dataset `fields/<varname>` of an HDF5 file),
+    ! rolled by shifts(:,it) cells (point i of the tile holds point i+shift of the file); along periodic
+    ! directions, the indices outside the domain wrap around, and along the other directions they are ghost
+    ! points, which are not read; for each tile, the points to read form runs of indices per direction,
+    ! in increasing order, selected by the file view (MPI-IO) or by a union of hyperslabs (HDF5), and all
+    ! tasks read their part of the tile (possibly none) with one collective call
     !
     implicit none
-    character(len=*), intent(in) :: fname,fmt,varname
-    integer(MPI_OFFSET_KIND), intent(in) :: disp
-    integer , intent(in), dimension(3) :: ng
+    character(len=*), intent(in), dimension(:) :: fnames
+    character(len=*), intent(in) :: fmt,varname
+    integer(MPI_OFFSET_KIND), intent(in), dimension(:) :: disps
+    integer , intent(in), dimension(3)   :: ng,nt
+    integer , intent(in), dimension(:,:) :: shifts
     integer , intent(in) :: iprec
     logical , intent(in), dimension(3) :: is_periodic
     integer , intent(in), dimension(3) :: lo,hi
     real(rp), intent(inout), dimension(lo(1):,lo(2):,lo(3):) :: p
-    integer , dimension(2,3) :: bstart,blen
-    integer , dimension(3) :: nb,nr,ia,ib
-    integer , allocatable, dimension(:) :: posx,posy,posz
+    type(runs_1d), dimension(3) :: runs
+    integer , dimension(3) :: nr,tc,m
+    integer , allocatable, dimension(:) :: posx,posy,posz,ix,iy,iz,px,py,pz
     real(sp), allocatable, dimension(:,:,:) :: buf_sp
     real(dp), allocatable, dimension(:,:,:) :: buf_dp
-    integer :: i,j,k,jj,kk
+    integer :: it,i,j,k
     !
     allocate(posx(lo(1):hi(1)),posy(lo(2):hi(2)),posz(lo(3):hi(3)))
-    call get_file_runs(ng(1),is_periodic(1),lo(1),hi(1),nb(1),bstart(:,1),blen(:,1),ia(1),ib(1),posx)
-    call get_file_runs(ng(2),is_periodic(2),lo(2),hi(2),nb(2),bstart(:,2),blen(:,2),ia(2),ib(2),posy)
-    call get_file_runs(ng(3),is_periodic(3),lo(3),hi(3),nb(3),bstart(:,3),blen(:,3),ia(3),ib(3),posz)
-    nr(:) = [sum(blen(1:nb(1),1)),sum(blen(1:nb(2),2)),sum(blen(1:nb(3),3))]
-    if(iprec == 4) then
-      allocate(buf_sp(nr(1),nr(2),nr(3)))
-    else
-      allocate(buf_dp(nr(1),nr(2),nr(3)))
-    end if
-    if(fmt == 'hdf5') then
-#if defined(_USE_HDF5)
+    do it=1,size(fnames)
+      tc(:) = [mod(it-1,nt(1)),mod((it-1)/nt(1),nt(2)),(it-1)/(nt(1)*nt(2))]
+      call get_tile_runs(ng(1),nt(1),tc(1),shifts(1,it),is_periodic(1),lo(1),hi(1),runs(1),posx)
+      call get_tile_runs(ng(2),nt(2),tc(2),shifts(2,it),is_periodic(2),lo(2),hi(2),runs(2),posy)
+      call get_tile_runs(ng(3),nt(3),tc(3),shifts(3,it),is_periodic(3),lo(3),hi(3),runs(3),posz)
+      nr(:) = [sum(runs(1)%length),sum(runs(2)%length),sum(runs(3)%length)]
       if(iprec == 4) then
-        call h5_read_block(fname,varname,nb,bstart,blen,buf_sp=buf_sp)
+        allocate(buf_sp(nr(1),nr(2),nr(3)))
       else
-        call h5_read_block(fname,varname,nb,bstart,blen,buf_dp=buf_dp)
+        allocate(buf_dp(nr(1),nr(2),nr(3)))
       end if
+      if(fmt == 'hdf5') then
+#if defined(_USE_HDF5)
+        if(iprec == 4) then
+          call h5_read_block(fnames(it),varname,runs,buf_sp=buf_sp)
+        else
+          call h5_read_block(fnames(it),varname,runs,buf_dp=buf_dp)
+        end if
 #else
-      associate(dummy_varname => varname)
-      end associate
-      call abort_run(MSG_NO_HDF5)
+        associate(dummy_varname => varname) ! silences warnings on arguments only used with HDF5
+        end associate
+        call abort_run(MSG_NO_HDF5)
 #endif
-    else
-      call read_runs_mpiio()
-    end if
-    !
-    ! copy the points read to the block, in double precision
-    !
-    if(iprec == 4) then
-      do k=ia(3),ib(3)
-        kk = posz(k)
-        do j=ia(2),ib(2)
-          jj = posy(j)
-          do i=ia(1),ib(1)
-            p(i,j,k) = buf_sp(posx(i),jj,kk)
+      else
+        call read_runs_mpiio(fnames(it),disps(it))
+      end if
+      !
+      ! copy the points read to the block, in double precision
+      !
+      ix = pack([(i,i=lo(1),hi(1))],posx(:) > 0); px = pack(posx(:),posx(:) > 0)
+      iy = pack([(j,j=lo(2),hi(2))],posy(:) > 0); py = pack(posy(:),posy(:) > 0)
+      iz = pack([(k,k=lo(3),hi(3))],posz(:) > 0); pz = pack(posz(:),posz(:) > 0)
+      m(:) = [size(ix),size(iy),size(iz)]
+      if(iprec == 4) then
+        do k=1,m(3)
+          do j=1,m(2)
+            do i=1,m(1)
+              p(ix(i),iy(j),iz(k)) = buf_sp(px(i),py(j),pz(k))
+            end do
           end do
         end do
-      end do
-    else
-      do k=ia(3),ib(3)
-        kk = posz(k)
-        do j=ia(2),ib(2)
-          jj = posy(j)
-          do i=ia(1),ib(1)
-            p(i,j,k) = buf_dp(posx(i),jj,kk)
+        deallocate(buf_sp)
+      else
+        do k=1,m(3)
+          do j=1,m(2)
+            do i=1,m(1)
+              p(ix(i),iy(j),iz(k)) = buf_dp(px(i),py(j),pz(k))
+            end do
           end do
         end do
-      end do
-    end if
+        deallocate(buf_dp)
+      end if
+    end do
   contains
-    subroutine read_runs_mpiio()
+    subroutine read_runs_mpiio(fname,disp)
       implicit none
+      character(len=*), intent(in) :: fname
+      integer(MPI_OFFSET_KIND), intent(in) :: disp
       type(MPI_DATATYPE) :: etype,type_x,type_xr,type_y,type_yr,type_glob,type_loc
       type(MPI_FILE) :: fh
       integer(MPI_ADDRESS_KIND) :: esize
-      !
-      ! file view: rows (x), planes (x-y) and the whole field (x-y-z), each resized to its extent in the file
       !
       if(iprec == 4) then
         etype = MPI_REAL
       else
         etype = MPI_DOUBLE_PRECISION
       end if
+      call MPI_FILE_OPEN(MPI_COMM_WORLD,fname,MPI_MODE_RDONLY,MPI_INFO_NULL,fh,ierr)
+      if(ierr /= MPI_SUCCESS) call abort_run('could not open checkpoint file `'//fname//'`.')
+      if(any(nr(:) == 0)) then
+        !
+        ! no point of this tile: an empty collective read
+        !
+        call MPI_FILE_SET_VIEW(fh,disp,etype,etype,'native',MPI_INFO_NULL,ierr)
+        if(iprec == 4) then
+          call MPI_FILE_READ_ALL(fh,buf_sp,0,etype,MPI_STATUS_IGNORE,ierr)
+        else
+          call MPI_FILE_READ_ALL(fh,buf_dp,0,etype,MPI_STATUS_IGNORE,ierr)
+        end if
+        call MPI_FILE_CLOSE(fh,ierr)
+        return
+      end if
+      !
+      ! file view: rows (x), planes (x-y) and the whole field (x-y-z), each resized to its extent in the file
+      !
       esize = iprec
-      call MPI_TYPE_INDEXED(nb(1),blen(1:nb(1),1),bstart(1:nb(1),1)-1,etype  ,type_x,ierr)
+      call MPI_TYPE_INDEXED(runs(1)%n,runs(1)%length,runs(1)%start-1,etype  ,type_x,ierr)
       call MPI_TYPE_CREATE_RESIZED(type_x,0_MPI_ADDRESS_KIND,esize*ng(1)      ,type_xr,ierr)
-      call MPI_TYPE_INDEXED(nb(2),blen(1:nb(2),2),bstart(1:nb(2),2)-1,type_xr,type_y,ierr)
+      call MPI_TYPE_INDEXED(runs(2)%n,runs(2)%length,runs(2)%start-1,type_xr,type_y,ierr)
       call MPI_TYPE_CREATE_RESIZED(type_y,0_MPI_ADDRESS_KIND,esize*ng(1)*ng(2),type_yr,ierr)
-      call MPI_TYPE_INDEXED(nb(3),blen(1:nb(3),3),bstart(1:nb(3),3)-1,type_yr,type_glob,ierr)
+      call MPI_TYPE_INDEXED(runs(3)%n,runs(3)%length,runs(3)%start-1,type_yr,type_glob,ierr)
       call MPI_TYPE_COMMIT(type_glob,ierr)
       call MPI_TYPE_CONTIGUOUS(nr(1)*nr(2),etype,type_loc,ierr)
       call MPI_TYPE_COMMIT(type_loc,ierr)
-      !
-      call MPI_FILE_OPEN(MPI_COMM_WORLD,fname,MPI_MODE_RDONLY,MPI_INFO_NULL,fh,ierr)
-      if(ierr /= MPI_SUCCESS) call abort_run('could not open checkpoint file `'//fname//'`.')
       call MPI_FILE_SET_VIEW(fh,disp,etype,type_glob,'native',MPI_INFO_NULL,ierr)
       if(iprec == 4) then
         call MPI_FILE_READ_ALL(fh,buf_sp,nr(3),type_loc,MPI_STATUS_IGNORE,ierr)
@@ -228,63 +252,66 @@ contains
     end subroutine read_runs_mpiio
   end subroutine read_block
   !
-  subroutine get_file_runs(n,is_periodic,lo,hi,nb,bstart,blen,ia,ib,pos)
+  subroutine get_tile_runs(n,nt,tc,shift,is_periodic,lo,hi,runs,pos)
     !
-    ! maps the indices lo:hi along a direction with n points to the file indices 1:n (modulo n if periodic;
-    ! otherwise, the indices outside 1:n are ghost points, not read): the file indices to read form nb runs
-    ! (one, or two if the range wraps around), starting at bstart(1:nb) and of lengths blen(1:nb), in
-    ! increasing order; ia:ib are the indices read, and pos(i) the position of the file index of i among
-    ! the points read
+    ! maps the indices lo:hi along a direction of the input domain, made of nt tiles of n points, to the
+    ! indices of the file of tile tc (0 to nt-1), rolled by `shift` (along periodic directions, the indices
+    ! wrap around the domain; along the other directions, nt = 1 and the indices outside 1:n are ghost
+    ! points, not read): the file indices to read form `runs`, in increasing order, and pos(i) is the
+    ! position of the file index of i among the points read (0 if i is not in the tile, or a ghost point)
     !
     implicit none
-    integer, intent(in ) :: n
-    logical, intent(in ) :: is_periodic
-    integer, intent(in ) :: lo,hi
-    integer, intent(out) :: nb
-    integer, intent(out), dimension(2) :: bstart,blen
-    integer, intent(out) :: ia,ib
-    integer, intent(out), dimension(lo:) :: pos
-    integer :: i,ig,ig0,nn
+    integer      , intent(in ) :: n,nt,tc,shift
+    logical      , intent(in ) :: is_periodic
+    integer      , intent(in ) :: lo,hi
+    type(runs_1d), intent(out) :: runs
+    integer      , intent(out), dimension(lo:) :: pos
+    integer, dimension(lo:hi) :: ifile
+    logical, dimension(n) :: is_read
+    integer, dimension(n) :: rank
+    integer :: i,ig,nruns
     !
-    bstart(:) = 1
-    blen(:)   = 0
-    pos(:)    = 0
-    if(.not.is_periodic) then
-      ia = max(lo,1)
-      ib = min(hi,n)
-      nb = 1
-      bstart(1) = ia
-      blen(1)   = ib-ia+1
-      do i=ia,ib
-        pos(i) = i-ia+1
-      end do
-    else
-      ia = lo
-      ib = hi
-      nn  = hi-lo+1
-      ig0 = modulo(lo-1,n)+1
-      if(nn >= n) then
-        nb = 1
-        blen(1) = n
-      else if(ig0+nn-1 <= n) then
-        nb = 1
-        bstart(1) = ig0
-        blen(1)   = nn
+    ifile(:) = 0
+    is_read(:) = .false.
+    do i=lo,hi
+      if(is_periodic) then
+        ig = modulo(i-1,nt*n)
+        if(ig/n /= tc) cycle
+        ifile(i) = modulo(ig-tc*n+shift,n) + 1
       else
-        nb = 2
-        bstart(:) = [1,ig0]
-        blen(:)   = [ig0+nn-1-n,n-ig0+1]
+        if(i < 1 .or. i > n) cycle
+        ifile(i) = i
       end if
-      do i=lo,hi
-        ig = modulo(i-1,n)+1
-        if(ig >= bstart(nb)) then
-          pos(i) = sum(blen(1:nb-1)) + ig-bstart(nb)+1
-        else
-          pos(i) = ig-bstart(1)+1
-        end if
-      end do
-    end if
-  end subroutine get_file_runs
+      is_read(ifile(i)) = .true.
+    end do
+    nruns = count(is_read(1:1)) + count(is_read(2:n) .and. .not.is_read(1:n-1))
+    runs%n = nruns
+    allocate(runs%start(nruns),runs%length(nruns))
+    nruns = 0
+    do i=1,n
+      if(.not.is_read(i)) cycle
+      if(i == 1) then
+        nruns = nruns + 1
+        runs%start(nruns) = i
+        runs%length(nruns) = 0
+      else if(.not.is_read(i-1)) then
+        nruns = nruns + 1
+        runs%start(nruns) = i
+        runs%length(nruns) = 0
+      end if
+      runs%length(nruns) = runs%length(nruns) + 1
+    end do
+    rank(:) = 0
+    nruns = 0
+    do i=1,n
+      if(is_read(i)) then
+        nruns = nruns + 1
+        rank(i) = nruns
+      end if
+    end do
+    pos(:) = 0
+    where(ifile(:) > 0) pos(:) = rank(max(ifile(:),1))
+  end subroutine get_tile_runs
   !
   subroutine write_field(fname,fmt,varname,ng,lo,hi,iprec,p,time,istep,x,y,z,is_compress)
     !

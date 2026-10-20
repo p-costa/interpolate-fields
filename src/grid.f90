@@ -14,7 +14,7 @@ module mod_grid
 #endif
   implicit none
   private
-  public grid_1d,init_grid,is_same_length
+  public grid_1d,init_grid,tile_grid,is_same_length
   type grid_1d
     integer  :: n
     real(rp) :: l
@@ -40,7 +40,7 @@ contains
     real(sp), allocatable, dimension(:,:) :: buf_sp
     real(dp), allocatable, dimension(:,:) :: buf_dp
     integer(i8) :: fsize
-    integer :: i,iunit,istat
+    integer :: iunit,istat
     character(len=16) :: cn
     !
     if(n < 1) call abort_run('the number of grid cells `ng` must be prescribed and positive.')
@@ -50,13 +50,7 @@ contains
     if(len_trim(fname) == 0) then
       if(l <= 0._rp) call abort_run('the domain length `l` must be prescribed and positive for a uniform grid.')
       g%iprec = 0
-      g%l = l
-      do i=0,n
-        g%xf(i) = (i*l)/n
-      end do
-      do i=1,n
-        g%xc(i) = ((i-0.5_rp)*l)/n
-      end do
+      call set_uniform(l,g)
     else
       write(cn,'(i0)') n
       allocate(buf_dp(n,4))
@@ -114,9 +108,66 @@ contains
       if(l > 0._rp .and. .not.is_same_length(l,g%l,g%iprec == 4)) &
         call abort_run('the domain length `l` is inconsistent with grid file `'//trim(fname)//'`.')
     end if
+    call complete_grid(g)
+  end subroutine init_grid
+  !
+  subroutine tile_grid(nt,g)
     !
-    ! ghost points
+    ! replaces a periodic grid by nt copies of it, one after the other (a uniform grid stays uniform)
     !
+    implicit none
+    integer      , intent(in   ) :: nt
+    type(grid_1d), intent(inout) :: g
+    type(grid_1d) :: g1
+    integer :: n,it
+    !
+    if(nt == 1) return
+    g1 = g
+    n  = g1%n
+    deallocate(g%xc,g%xf,g%dxc,g%dxf,g%wc,g%ws)
+    g%n = nt*n
+    allocate(g%xc(0:g%n+1),g%xf(0:g%n+1),g%dxc(0:g%n+1),g%dxf(0:g%n+1),g%wc(g%n),g%ws(g%n))
+    if(g1%iprec == 0) then
+      call set_uniform(nt*g1%l,g)
+    else
+      g%l = nt*g1%l
+      g%xf(0) = 0._rp
+      do it=0,nt-1
+        g%xf(it*n+1:(it+1)*n) = it*g1%l + g1%xf(1:n)
+        g%xc(it*n+1:(it+1)*n) = it*g1%l + g1%xc(1:n)
+      end do
+    end if
+    call complete_grid(g)
+  end subroutine tile_grid
+  !
+  subroutine set_uniform(l,g)
+    !
+    ! uniform grid with g%n cells over a length l
+    !
+    implicit none
+    real(rp)     , intent(in   ) :: l
+    type(grid_1d), intent(inout) :: g
+    integer :: i,n
+    n   = g%n
+    g%l = l
+    do i=0,n
+      g%xf(i) = (i*l)/n
+    end do
+    do i=1,n
+      g%xc(i) = ((i-0.5_rp)*l)/n
+    end do
+  end subroutine set_uniform
+  !
+  subroutine complete_grid(g)
+    !
+    ! ghost points, spacings and control volumes, from the faces xf(0:n) and centres xc(1:n)
+    !
+    implicit none
+    type(grid_1d), intent(inout) :: g
+    integer :: n
+    logical :: is_periodic
+    n = g%n
+    is_periodic = g%is_periodic
     if(is_periodic) then
       g%xc(0  ) = g%xc(n) - g%l
       g%xc(n+1) = g%xc(1) + g%l
@@ -135,7 +186,7 @@ contains
     g%wc(:) = g%dxf(1:n)
     g%ws(:) = g%dxc(1:n)
     if(.not.is_periodic) g%ws(n) = g%xf(n) - g%xc(n)
-  end subroutine init_grid
+  end subroutine complete_grid
   !
   logical function is_same_length(l1,l2,is_single)
     !

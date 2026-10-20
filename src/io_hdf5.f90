@@ -13,7 +13,7 @@ module mod_io_hdf5
   use hdf5
 #endif
   use mpi_f08
-  use mod_common, only: rp,sp,dp,i8,myid,ierr,abort_run,CHUNK_BYTES
+  use mod_common, only: rp,sp,dp,i8,myid,ierr,abort_run,CHUNK_BYTES,runs_1d
   implicit none
   private
   public is_hdf5_enabled,is_hdf5_file,MSG_NO_HDF5
@@ -161,21 +161,23 @@ contains
     istep = meta_istep(1)
   end subroutine h5_read_fldinfo
   !
-  subroutine h5_read_block(fname,varname,nb,bstart,blen,buf_sp,buf_dp)
+  subroutine h5_read_block(fname,varname,runs,buf_sp,buf_dp)
     !
-    ! reads the points of dataset `fields/<varname>` with indices in the runs bstart(1:nb(idir),idir) to
-    ! bstart+blen-1 along each direction (a union of hyperslabs, in increasing order) into buf_sp or buf_dp
-    ! (whichever is present, in the precision of the file); all tasks read with one collective call
+    ! reads the points of dataset `fields/<varname>` with indices in the runs along each direction (a union
+    ! of hyperslabs, in increasing order) into buf_sp or buf_dp (whichever is present, in the precision of
+    ! the file; with no run along a direction, nothing is read); all tasks read with one collective call
     !
     implicit none
     character(len=*), intent(in) :: fname,varname
-    integer , intent(in), dimension(3)   :: nb
-    integer , intent(in), dimension(2,3) :: bstart,blen
-    real(sp), intent(out), dimension(:,:,:), optional :: buf_sp
-    real(dp), intent(out), dimension(:,:,:), optional :: buf_dp
+    type(runs_1d)   , intent(in), dimension(3) :: runs
+    real(sp), intent(inout), dimension(:,:,:), optional :: buf_sp
+    real(dp), intent(inout), dimension(:,:,:), optional :: buf_dp
+    real(sp), dimension(1,1,1) :: dummy_sp
+    real(dp), dimension(1,1,1) :: dummy_dp
     integer(HID_T) :: file_id,dset,filespace,memspace,plist_id
     integer(HSIZE_T), dimension(3) :: offset,count,nr
     integer :: hdferr,istat,ib,jb,kb,iop
+    logical :: is_empty
     !
     call h5open_f(hdferr)
     call h5pcreate_f(H5P_FILE_ACCESS_F,plist_id,hdferr)
@@ -185,31 +187,45 @@ contains
     if(istat < 0) call abort_run('could not open checkpoint file `'//fname//'`.')
     call h5dopen_f(file_id,'fields/'//varname,dset,hdferr)
     call h5dget_space_f(dset,filespace,hdferr)
-    iop = H5S_SELECT_SET_F
-    do kb=1,nb(3)
-      do jb=1,nb(2)
-        do ib=1,nb(1)
-          offset(:) = [bstart(ib,1),bstart(jb,2),bstart(kb,3)] - 1
-          count(:)  = [blen(ib,1)  ,blen(jb,2)  ,blen(kb,3)  ]
-          call h5sselect_hyperslab_f(filespace,iop,offset,count,hdferr)
-          iop = H5S_SELECT_OR_F
+    is_empty = any(runs(:)%n == 0)
+    if(is_empty) then
+      nr(:) = 1
+      call h5sselect_none_f(filespace,hdferr)
+      call h5screate_simple_f(3,nr,memspace,hdferr)
+      call h5sselect_none_f(memspace,hdferr)
+    else
+      iop = H5S_SELECT_SET_F
+      do kb=1,runs(3)%n
+        do jb=1,runs(2)%n
+          do ib=1,runs(1)%n
+            offset(:) = [runs(1)%start(ib) ,runs(2)%start(jb) ,runs(3)%start(kb) ] - 1
+            count(:)  = [runs(1)%length(ib),runs(2)%length(jb),runs(3)%length(kb)]
+            call h5sselect_hyperslab_f(filespace,iop,offset,count,hdferr)
+            iop = H5S_SELECT_OR_F
+          end do
         end do
       end do
-    end do
-    if(present(buf_sp)) then
-      nr(:) = shape(buf_sp)
-    else
-      nr(:) = shape(buf_dp)
+      nr(:) = [sum(runs(1)%length),sum(runs(2)%length),sum(runs(3)%length)]
+      call h5screate_simple_f(3,nr,memspace,hdferr)
     end if
-    call h5screate_simple_f(3,nr,memspace,hdferr)
     call h5pcreate_f(H5P_DATASET_XFER_F,plist_id,hdferr)
     call h5pset_dxpl_mpio_f(plist_id,H5FD_MPIO_COLLECTIVE_F,hdferr)
     if(present(buf_sp)) then
-      call h5dread_f(dset,H5T_NATIVE_REAL  ,buf_sp,nr,hdferr,mem_space_id=memspace,file_space_id=filespace, &
-                     xfer_prp=plist_id)
+      if(is_empty) then
+        call h5dread_f(dset,H5T_NATIVE_REAL,dummy_sp,nr,hdferr,mem_space_id=memspace,file_space_id=filespace, &
+                       xfer_prp=plist_id)
+      else
+        call h5dread_f(dset,H5T_NATIVE_REAL,buf_sp,nr,hdferr,mem_space_id=memspace,file_space_id=filespace, &
+                       xfer_prp=plist_id)
+      end if
     else
-      call h5dread_f(dset,H5T_NATIVE_DOUBLE,buf_dp,nr,hdferr,mem_space_id=memspace,file_space_id=filespace, &
-                     xfer_prp=plist_id)
+      if(is_empty) then
+        call h5dread_f(dset,H5T_NATIVE_DOUBLE,dummy_dp,nr,hdferr,mem_space_id=memspace,file_space_id=filespace, &
+                       xfer_prp=plist_id)
+      else
+        call h5dread_f(dset,H5T_NATIVE_DOUBLE,buf_dp,nr,hdferr,mem_space_id=memspace,file_space_id=filespace, &
+                       xfer_prp=plist_id)
+      end if
     end if
     if(hdferr < 0) call abort_run('could not read dataset `fields/'//varname//'` of `'//fname//'`.')
     call h5pclose_f(plist_id,hdferr)
