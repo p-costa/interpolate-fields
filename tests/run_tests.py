@@ -6,7 +6,8 @@ usage: run_tests.py [--exe EXE] [--workdir DIR] [--keep] [test ...]
 Each test writes CaNS-format grid and checkpoint files, runs the program with several MPI process grids,
 and checks the output: identity on the same grid, exactness for linear fields, process-grid independence,
 precision conversion, legacy and per-variable input, variables on edges and corners, a comparison with an
-independent NumPy implementation, and the input checks. The MPI launcher is taken from the environment
+independent NumPy implementation, HDF5 input and output (with h5py, if the program is built with HDF5;
+otherwise, the error message), and the input checks. The MPI launcher is taken from the environment
 variable MPIRUN (default: 'mpirun --oversubscribe').
 """
 import argparse
@@ -18,6 +19,11 @@ import sys
 import tempfile
 
 import numpy as np
+
+try:
+    import h5py
+except ImportError:
+    h5py = None
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MPIRUN = shlex.split(os.environ.get('MPIRUN', 'mpirun --oversubscribe'))
@@ -97,6 +103,31 @@ def read_field(fname, shape, dtype=np.float64):
     n = int(np.prod(shape))
     assert raw.size == n + 2, f'{fname}: unexpected size'
     return raw[:n].reshape(shape, order='F'), raw[n:]
+
+
+def write_field_h5(fname, name, a, dtype=np.float64, time=1.5, step=100):
+    """HDF5 checkpoint as written by CaNS: fields/<name> (C order, i.e. z, y, x), meta/time, meta/istep"""
+    with h5py.File(fname, 'w') as f:
+        f.create_dataset(f'fields/{name}', data=np.asarray(a, dtype=dtype).T)
+        f.create_dataset('meta/time', data=np.array([time], dtype=dtype))
+        f.create_dataset('meta/istep', data=np.array([step], dtype=np.int32))
+
+
+def read_field_h5(fname, name):
+    with h5py.File(fname, 'r') as f:
+        d = f[f'fields/{name}']
+        return d[()].T, np.array([f['meta/time'][0], f['meta/istep'][0]]), d.dtype, d.chunks, d.compression, \
+            {k: f[f'grid/{k}'][()] for k in 'xyz'}
+
+
+def write_grid_h5(fname, g, dtype=np.float64):
+    """CaNS grid file in HDF5: rc, rf, drc, drf (n values each)"""
+    xf, xc = g.with_ghosts(False)
+    with h5py.File(fname, 'w') as f:
+        f['rc'] = g.xc[1:].astype(dtype)
+        f['rf'] = g.xf[1:].astype(dtype)
+        f['drc'] = (xc[2:] - xc[1:-1]).astype(dtype)
+        f['drf'] = np.diff(g.xf).astype(dtype)
 
 
 # ----------------------------------------------------------------------------------------------------------
@@ -518,7 +549,7 @@ def test_input_errors(workdir):
                                                           'bc': {'q': CHANNEL_BC['p']}}), 'size of checkpoint'),
         (case_nml(variables=['omz'], locs={}, **base), 'must be prescribed in a `&variable` group'),
         (case_nml(variables=['p'], locs={}, **{**base, 'cbc': {}, 'bc': {}}), 'boundary conditions'),
-        (case_nml(variables=['p'], locs={}, **base, extra={'output_prefix': 'fld_i'}), 'must differ'),
+        (case_nml(variables=['p'], locs={}, **base, extra={'output_prefix': 'fld_i'}), 'would overwrite its input'),
         (case_nml(variables=['p'], locs={}, **base, dims=(1, 3, 0)), 'inconsistent with the number of MPI tasks'),
         (case_nml(variables=['p'], locs={}, **{**base, 'go': [uniform(18, 6.), go[1], go[2]]}),
          'domain lengths along x differ'),
@@ -531,8 +562,103 @@ def test_input_errors(workdir):
     print(f'  input errors: {len(checks)} cases stop with the expected message')
 
 
+def hdf5_enabled(workdir):
+    """whether the program is built with HDF5 (otherwise, a request for HDF5 output stops with a message)"""
+    gi = [uniform(4, 1.), uniform(4, 1.), uniform(4, 1.)]
+    cbc, bc = {'p': [['P', 'P']]*3}, {'p': [[0, 0]]*3}
+    write_field(os.path.join(workdir, 'fld_i_p.bin'), np.zeros(shape(gi)))
+    nml = case_nml(gi, gi, ['']*3, ['']*3, ['p'], cbc, bc, {}, extra={'output_format': 'hdf5'})
+    with open(os.path.join(workdir, 'interp.nml'), 'w') as f:
+        f.write(nml)
+    r = subprocess.run(MPIRUN + ['-n', '1', EXE], cwd=workdir, capture_output=True, text=True)
+    if 'HDF5 support is not compiled in' in r.stdout:
+        return False
+    assert r.returncode == 0, r.stdout + r.stderr
+    return True
+
+
+def test_hdf5(workdir):
+    """HDF5 checkpoints and grid files, in and out, against the MPI-IO files; compression; process grids"""
+    gi, go, files = grids('eigen')
+    names = ['u', 'v', 'w', 'p', 's_001']
+    cbc, bc = walls_bc(names, [['P', 'P'], ['D', 'N'], ['N', 'D']])
+    periodic = [True, False, False]
+    locs = {n: DEFAULT_LOC.get(n, 'ccc') for n in names}
+    if not hdf5_enabled(workdir):
+        fi, fo = setup(workdir, gi, go, files)
+        for n in names:
+            write_field(os.path.join(workdir, f'fld_i_{n}.bin'), random_field(gi, locs[n], periodic, cbc[n], bc[n], 0))
+        checks = [{'input_format': 'hdf5'}, {'output_format': 'hdf5'}, None]
+        for extra in checks:
+            fh = fi if extra else fi[:2] + ['grid_i_z.h5']
+            out = run(workdir, case_nml(gi, go, fh, fo, names, cbc, bc, {}, extra=extra), 2, expect_fail=True)
+            assert 'HDF5 support is not compiled in' in out, out
+        print(f'  HDF5 not compiled in: {len(checks)} requests (input, output, grid file) stop with the message')
+        return
+    assert h5py is not None, 'the HDF5 tests need h5py'
+    for dtype in [np.float64, np.float32]:
+        fi, fo = setup(workdir, gi, go, files, dtype)
+        fi_h5 = [f.replace('.bin', '.h5') for f in fi]
+        fo_h5 = [f.replace('.bin', '.h5') for f in fo]
+        for d in range(3):
+            write_grid_h5(os.path.join(workdir, fi_h5[d]), gi[d], dtype)
+            write_grid_h5(os.path.join(workdir, fo_h5[d]), go[d], dtype)
+        for i, n in enumerate(names):
+            a = random_field(gi, locs[n], periodic, cbc[n], bc[n], 50 + i).astype(dtype)
+            write_field(os.path.join(workdir, f'fld_i_{n}.bin'), a, dtype)
+            write_field_h5(os.path.join(workdir, f'fld_i_{n}.h5'), n, a, dtype)
+        out = {}
+        for fin, fout, grid_ext in [('per-variable', 'per-variable', 'bin'), ('per-variable', 'hdf5', 'bin'),
+                                    ('hdf5', 'per-variable', 'bin'), ('hdf5', 'hdf5', 'bin'), ('hdf5', 'hdf5', 'h5')]:
+            gfi, gfo = (fi, fo) if grid_ext == 'bin' else (fi_h5, fo_h5)
+            nml = case_nml(gi, go, gfi, gfo, names, cbc, bc, {}, dims=(2, 1, 2),
+                           extra={'input_format': fin, 'output_format': fout})
+            run(workdir, nml, 4)
+            for n in names:
+                if fout == 'hdf5':
+                    a, info, dt, chunks, comp, xyz = read_field_h5(os.path.join(workdir, f'fld_o_{n}.h5'), n)
+                    assert dt == dtype and chunks is None and comp is None, (dt, chunks, comp)
+                    for d, k in enumerate('xyz'):
+                        xf, xc = go[d].with_ghosts(periodic[d])
+                        x = xf if locs[n][d] == 's' else xc
+                        assert xyz[k].dtype == dtype and np.abs(xyz[k] - x.astype(dtype)).max() < 1e-6, (n, k)
+                else:
+                    a, info = read_field(os.path.join(workdir, f'fld_o_{n}.bin'), shape(go), dtype)
+                assert np.array_equal(info, [1.5, 100]), info
+                out.setdefault(n, a)
+                assert a.tobytes() == out[n].tobytes(), f'{n}: {fin} in, {fout} out, {grid_ext} grids differ'
+    print('  HDF5: identical values for any combination of .bin and .h5 input and output, and of .bin and .h5 '
+          'grid files, in single and double precision; time, step and coordinates written as CaNS')
+    # compression on and off, several process grids (with wrap-around reads along x), double precision
+    fi, fo = setup(workdir, gi, go, files)
+    for i, n in enumerate(names):
+        write_field_h5(os.path.join(workdir, f'fld_i_{n}.h5'), n,
+                       random_field(gi, locs[n], periodic, cbc[n], bc[n], 60 + i))
+    ref = {}
+    for nproc, dims, comp in [(1, (1, 1, 1), False), (4, (2, 1, 2), True), (6, (3, 2, 1), True), (5, (1, 1, 5), False),
+                              (8, (2, 2, 2), True)]:
+        nml = case_nml(gi, go, fi, fo, names, cbc, bc, {}, dims=dims,
+                       extra={'input_format': 'hdf5', 'output_format': 'hdf5', 'is_compress_output': comp})
+        run(workdir, nml, nproc)
+        for n in names:
+            a, _, _, chunks, compression, _ = read_field_h5(os.path.join(workdir, f'fld_o_{n}.h5'), n)
+            assert (compression == 'gzip' and chunks is not None) if comp else (compression is None), (comp, chunks)
+            ref.setdefault(n, a)
+            assert a.tobytes() == ref[n].tobytes(), f'{n}: HDF5 output depends on dims = {dims} or compression'
+    print('  HDF5: compression on and off give the same values, bitwise identical for 5 process grids')
+    # input checks: a missing dataset, and a field with the wrong dimensions
+    write_field_h5(os.path.join(workdir, 'fld_i_q.h5'), 'p', np.zeros(shape(gi)))
+    write_field_h5(os.path.join(workdir, 'fld_i_r.h5'), 'r', np.zeros(shape(go)))
+    for name, msg in [('q', 'has no dataset `fields/q`'), ('r', 'is not of dimensions')]:
+        nml = case_nml(gi, go, fi, fo, [name], {name: cbc['p']}, {name: bc['p']}, {name: 'ccc'},
+                       extra={'input_format': 'hdf5'})
+        out = run(workdir, nml, 2, expect_fail=True)
+        assert msg in out, out
+    print('  HDF5: a missing dataset and wrong dimensions stop with a message')
+
+
 TESTS = {'identity': test_identity, 'linear': test_linear, 'layouts': test_layouts, 'precision': test_precision,
-         'formats': test_formats, 'defaults': test_defaults, 'errors': test_input_errors}
+         'formats': test_formats, 'defaults': test_defaults, 'hdf5': test_hdf5, 'errors': test_input_errors}
 
 
 if __name__ == '__main__':
