@@ -21,6 +21,7 @@ INCS :=
 LIBS :=
 
 EXE := $(EXE_DIR)/$(TARGET)
+EXE_TASKS := $(EXE_DIR)/task-checkpoints
 
 # Configuration settings
 FC := mpifort
@@ -46,6 +47,7 @@ $(foreach src, $(SRCS) $(TEST_SRCS), $(eval $(src) := $(obj)))
 
 # Create lists of the build artefacts in this project
 OBJS := $(addsuffix .o, $(SRCS))
+LIB_OBJS := $(addsuffix .o, $(wildcard $(SRC_DIR)/*.f90))
 DEPS := $(addsuffix .d, $(SRCS))
 TEST_OBJS := $(addsuffix .o, $(TEST_SRCS))
 TEST_DEPS := $(addsuffix .d, $(TEST_SRCS))
@@ -55,7 +57,7 @@ TEST_EXE := $(patsubst %.f90, %.exe, $(TEST_SRCS))
 # Declare all public targets
 .PHONY: all clean
 #all: $(LIB) $(TEST_EXE) $(EXE)
-all: $(TEST_EXE) $(EXE)
+all: $(TEST_EXE) $(EXE) $(EXE_TASKS)
 
 # Create the static library from the object files
 #$(LIB): #$(OBJS)
@@ -65,9 +67,12 @@ all: $(TEST_EXE) $(EXE)
 $(TEST_EXE): %.exe: %.f90.o $(LIB)
 	$(LD) -o $@ $^
 
-$(EXE): $(OBJS)
+$(EXE): $(LIB_OBJS) $(APP_DIR)/interpolate-fields.f90.o
 	mkdir -p $(EXE_DIR)/data
-	$(FC) $(FFLAGS) $^ $(LIBS) -o $(EXE)
+	$(FC) $(FFLAGS) $^ $(LIBS) -o $@
+
+$(EXE_TASKS): $(LIB_OBJS) $(APP_DIR)/task-checkpoints.f90.o
+	$(FC) $(FFLAGS) $^ $(LIBS) -o $@
 
 # Create object files from Fortran source
 $(OBJS) $(TEST_OBJS): %.o: % | %.d
@@ -83,4 +88,4 @@ $(foreach dep, $(OBJS) $(TEST_OBJS), $(eval $(dep): $($(dep))))
 
 # Cleanup, filter to avoid removing source code by accident
 clean:
-	$(RM) $(filter %.o, $(OBJS) $(TEST_OBJS)) $(filter %.d, $(DEPS) $(TEST_DEPS)) $(filter %.exe, $(TEST_EXE)) $(wildcard *.mod) $(EXE)
+	$(RM) $(filter %.o, $(OBJS) $(TEST_OBJS)) $(filter %.d, $(DEPS) $(TEST_DEPS)) $(filter %.exe, $(TEST_EXE)) $(wildcard *.mod) $(EXE) $(EXE_TASKS)

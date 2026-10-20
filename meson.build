@@ -1,13 +1,13 @@
 project('interpit', 'fortran', meson_version: '>=0.49')
 
-sources = files('src/bound.f90',   \
-                'src/common.f90',  \
-                'src/grid.f90',    \
-                'src/interp.f90',  \
-                'src/io.f90',      \
-                'src/io_hdf5.f90', \
-                'src/param.f90',   \
-                'app/interpolate-fields.f90')
+lib_sources = files('src/bound.f90',   \
+                    'src/common.f90',  \
+                    'src/decomp.f90',  \
+                    'src/grid.f90',    \
+                    'src/interp.f90',  \
+                    'src/io.f90',      \
+                    'src/io_hdf5.f90', \
+                    'src/param.f90')
 
 # the sources are preprocessed (optional HDF5 support)
 fc = meson.get_compiler('fortran')
@@ -20,4 +20,6 @@ if get_option('hdf5')
   add_project_arguments('-D_USE_HDF5', language: 'fortran')
 endif
 
-executable('interpit', sources, dependencies: deps)
+lib = static_library('interpit', lib_sources, dependencies: deps)
+executable('interpit', 'app/interpolate-fields.f90', link_with: lib, dependencies: deps)
+executable('task-checkpoints', 'app/task-checkpoints.f90', link_with: lib, dependencies: deps)
