@@ -120,8 +120,5 @@ cbc(0:1,1:3) = 'P','P',  'D','D',  'N','N'
 /
 ```
 
-### Namelists of earlier versions
-The namelist was redesigned, and earlier `interp.nml` files need updating: `l`, `ni` and `no` become `ng` and `l` in `&grid_in` and `&grid_out`; `input_grid_file` and `output_grid_file` become `grid_files(3)` there; the boundary conditions move to `&bc`; `input_file` (legacy single file) needs `input_format = 'legacy'`; `output_file_prefix` becomes `output_prefix`; `dims` now has three entries, any of which may be decomposed; and `is_reset_time` defaults to `F`.
-
 ## Tests
 `tests/run_tests.py` (Python 3 with NumPy) runs the program on small synthetic cases, with several process grids: identity on the same grid, exactness for linear fields at all variable locations, bitwise process-grid independence and agreement with an independent NumPy implementation, precision conversion, legacy and per-variable input, the defaults, and the input checks. Run it after building, e.g. `python3 tests/run_tests.py` (see `--help`; the MPI launcher can be set with the environment variable `MPIRUN`).
