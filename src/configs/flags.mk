@@ -56,7 +56,3 @@ endif
 ifeq ($(strip $(CPP_DEBUG)),1)
 DEFINES += -D_DEBUG
 endif
-
-ifeq ($(strip $(NON_UNIFORM_Z)),1)
-DEFINES += -D_NON_UNIFORM_Z
-endif
