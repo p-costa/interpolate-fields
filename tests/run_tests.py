@@ -6,7 +6,8 @@ usage: run_tests.py [--exe EXE] [--workdir DIR] [--keep] [test ...]
 Each test writes CaNS-format grid and checkpoint files, runs the program with several MPI process grids,
 and checks the output: identity on the same grid, exactness for linear fields, process-grid independence,
 precision conversion, legacy and per-variable input, variables on edges and corners, a comparison with an
-independent NumPy implementation, field operations (mean removal, offsets, frame change), HDF5 input and output (with h5py, if the program is built with HDF5;
+independent NumPy implementation, field operations (mean removal, offsets, frame change), periodic tiling,
+HDF5 input and output (with h5py, if the program is built with HDF5;
 otherwise, the error message), and the input checks. The MPI launcher is taken from the environment
 variable MPIRUN (default: 'mpirun --oversubscribe').
 """
@@ -75,6 +76,28 @@ def stretched(n, l, gamma=1.5, periodic=False, seed=0):
     xf = xf*l
     xf[0], xf[-1] = 0., l
     return Grid1d(xf)
+
+
+def tiled_grid(g, nt):
+    """nt copies of a periodic grid, one after the other (a uniform grid stays uniform)"""
+    if nt == 1:
+        return g
+    if np.allclose(np.diff(g.xf), g.l/g.n, rtol=0, atol=1e-14):
+        return uniform(nt*g.n, nt*g.l)
+    xf = np.concatenate([[0.]] + [k*g.l + g.xf[1:] for k in range(nt)])
+    xc = np.concatenate([[np.nan]] + [k*g.l + g.xc[1:] for k in range(nt)])
+    return Grid1d(xf, xc)
+
+
+def tile_fields(fields, nt, shifts):
+    """the tiled field (x fastest) of the fields of the tiles, each rolled by its shift (point i of a tile
+    holds point i+shift of its field, as in make_ic.py)"""
+    n = fields[0].shape
+    out = np.empty([nt[d]*n[d] for d in range(3)])
+    for it, (a, s) in enumerate(zip(fields, shifts)):
+        tx, ty, tz = it % nt[0], (it//nt[0]) % nt[1], it//(nt[0]*nt[1])
+        out[tx*n[0]:(tx+1)*n[0], ty*n[1]:(ty+1)*n[1], tz*n[2]:(tz+1)*n[2]] = np.roll(a, [-x for x in s], axis=(0, 1, 2))
+    return out
 
 
 def write_grid(fname, g, dtype=np.float64):
@@ -189,10 +212,10 @@ def cbc_bc_items(cbc, bc):
         yield name, (np.asarray(cbc[name]).T, np.asarray(bc[name], dtype=float).T)
 
 
-def case_nml(gi, go, files_i, files_o, variables, cbc, bc, locs, dims=(1, 0, 0), extra=None, ops=None):
+def case_nml(gi, go, files_i, files_o, variables, cbc, bc, locs, dims=(1, 0, 0), extra=None, ops=None, tiling=None):
     """namelist of a case: gi, go: lists of Grid1d per direction; files_*: grid file names ('' = uniform);
     cbc, bc: per variable, arrays (3, 2) of [direction][side]; locs: locations of non-default variables;
-    extra: other `&interp` entries; ops: `&operations` entries"""
+    extra: other `&interp` entries; ops: `&operations` entries; tiling: `&tiling` entries"""
     interp = {'dims(1:3)': list(dims), 'variables': variables, 'input_format': 'per-variable',
               'input_prefix': 'fld_i', 'output_prefix': 'fld_o'}
     interp.update(extra or {})
@@ -207,6 +230,8 @@ def case_nml(gi, go, files_i, files_o, variables, cbc, bc, locs, dims=(1, 0, 0),
                                         'bc(0:1,1:3)': np.asarray(bc[name], dtype=float).T}))
     if ops:
         groups.append(('operations', ops))
+    if tiling:
+        groups.append(('tiling', tiling))
     return namelist(groups)
 
 
@@ -745,9 +770,129 @@ def test_operations(workdir):
     print('  operations: conflicting or out-of-range options stop with a message')
 
 
+def test_tiling(workdir):
+    """periodic tiling from one or several snapshots, with shifts and the mean of each snapshot removed"""
+    gi = [uniform(8, 2*np.pi), uniform(6, np.pi), stretched(10, 2., 1.8)]
+    names = ['u', 'v', 'w', 'p']
+    cbc, bc = CHANNEL_CBC, CHANNEL_BC
+    periodic = [True, True, False]
+    nt = [2, 2, 1]
+    gt = [tiled_grid(gi[d], nt[d]) for d in range(3)]
+    files = [False, False, True]
+    fi, ft = setup(workdir, gi, gt, files)
+    snaps = 'abcd'
+    data = {(t, n): random_field(gi, DEFAULT_LOC[n], periodic, cbc[n], bc[n], 80 + 4*i + j)
+            for i, t in enumerate(snaps) for j, n in enumerate(names)}
+
+    def run_tiling(tiling, go, fo, dims=(1, 2, 2), nproc=4, ops=None, big=None):
+        for t in snaps:
+            for n in names:
+                a = data[(t, n)] + (big[t] if (big and n == 'p') else 0.)
+                write_field(os.path.join(workdir, f'fld_{t}_{n}.bin'), a, time=1.5 + snaps.index(t))
+        nml = case_nml(gi, go, fi, fo, names, cbc, bc, {}, dims=dims, extra={'input_prefix': 'fld_a'},
+                       ops=ops, tiling=tiling)
+        log = run(workdir, nml, nproc)
+        out = {}
+        for n in names:
+            out[n], info = read_field(os.path.join(workdir, f'fld_o_{n}.bin'), shape(go))
+            assert np.array_equal(info, [1.5, 100]), info
+        return out, log
+    # one snapshot, 2 x 2 tiles, no shifts, onto the tiled grid: the periodic replication of the snapshot
+    out, log = run_tiling({'ntiles(1:3)': nt}, gt, ft)
+    for n in names:
+        assert np.array_equal(out[n], np.tile(data[('a', n)], nt)), f'{n}: not the periodic replication'
+    assert 'Tiling:' in log
+    # shifts: one tile rolled; four snapshots, each rolled by its own shift
+    shifts = [[3, -2, 0], [0, 1, 0], [5, 0, 0], [-1, 4, 0]]
+    out1 = run_tiling({'tile_shifts(1:3,1)': shifts[0]}, gi, fi)[0]
+    for n in names:
+        assert np.array_equal(out1[n], np.roll(data[('a', n)], (-3, 2), axis=(0, 1))), f'{n}: not the rolled snapshot'
+    tiling = {'ntiles(1:3)': nt, 'tile_inputs(1:4)': [f'fld_{t}' for t in snaps],
+              'tile_shifts(1:3,1:4)': np.array(shifts).T}
+    out = run_tiling(tiling, gt, ft)[0]
+    for n in names:
+        ref = tile_fields([data[(t, n)] for t in snaps], nt, shifts)
+        assert np.array_equal(out[n], ref), f'{n}: not the tiled, rolled snapshots'
+    print('  tiling: periodic replication of one snapshot, rolled snapshot, and four rolled snapshots, exact')
+    # four snapshots with different pressure means, removed per snapshot (no jumps between the tiles)
+    big = {'a': 3.e5, 'b': -1.e3, 'c': 949381., 'd': 12.}
+    out = run_tiling(tiling, gt, ft, ops={'is_remove_mean(4)': True}, big=big)[0]
+    pt = tile_fields([data[(t, 'p')] - weighted_mean(data[(t, 'p')], gi, 'ccc', periodic) for t in snaps],
+                     nt, shifts)
+    pt -= weighted_mean(pt, gt, 'ccc', periodic)
+    err = np.abs(out['p'] - pt).max()
+    assert err < 1e-9, f'p: mean removal per snapshot gives an error {err}'
+    # tiling and interpolation onto a refined, non-uniform output grid; process-grid independence
+    go = [uniform(13, 4*np.pi), uniform(17, 2*np.pi), stretched(15, 2., 2.4)]
+    fo = ['', '', 'grid_o2_z.bin']
+    write_grid(os.path.join(workdir, fo[2]), go[2])
+    ref = {}
+    for n in names:
+        a = tile_fields([data[(t, n)] for t in snaps], nt, shifts)
+        ref[n] = reference(a, gt, go, DEFAULT_LOC[n], np.asarray(cbc[n]), np.asarray(bc[n], float), periodic)
+    first = None
+    for nproc, dims in [(1, (1, 1, 1)), (4, (2, 2, 1)), (6, (3, 1, 2)), (5, (5, 1, 1))]:
+        out = run_tiling(tiling, go, fo, dims=dims, nproc=nproc)[0]
+        for n in names:
+            err = np.abs(out[n] - ref[n]).max()
+            assert err < 1e-12, f'{n}: tiling and interpolation differ from the reference by {err}'
+        if first is None:
+            first = out
+        assert all(out[n].tobytes() == first[n].tobytes() for n in names), f'output depends on dims = {dims}'
+    print('  tiling: mean removed per snapshot; interpolation onto a non-uniform grid equal to the reference, '
+          'bitwise identical for 4 process grids')
+    if h5py is not None and hdf5_enabled(workdir):
+        # the same from HDF5 files (tasks that read no point of a tile make empty selections)
+        for t in snaps:
+            for n in names:
+                write_field_h5(os.path.join(workdir, f'fld_{t}_{n}.h5'), n, data[(t, n)], time=1.5 + snaps.index(t))
+        nml = case_nml(gi, go, fi, fo, names, cbc, bc, {}, dims=(5, 1, 1),
+                       extra={'input_prefix': 'fld_a', 'input_format': 'hdf5'}, tiling=tiling)
+        run(workdir, nml, 5)
+        for n in names:
+            a, info = read_field(os.path.join(workdir, f'fld_o_{n}.bin'), shape(go))
+            assert a.tobytes() == first[n].tobytes() and np.array_equal(info, [1.5, 100]), f'{n}: HDF5 tiles differ'
+        print('  tiling: the same from HDF5 checkpoints')
+    # tiling along a non-uniform periodic direction (CaNS-EIGEN), without shifts
+    ge = [stretched(9, 1.5, periodic=True, seed=3), uniform(6, 1.), stretched(8, 1., 1.6)]
+    gte = [tiled_grid(ge[0], 3), ge[1], ge[2]]
+    goe = [stretched(20, 4.5, periodic=True, seed=4), uniform(7, 1.), stretched(11, 1., 1.3)]
+    fie, foe = setup(workdir, ge, goe, [True, False, True])
+    a = random_field(ge, 'ccc', periodic, CHANNEL_CBC['p'], CHANNEL_BC['p'], 99)
+    write_field(os.path.join(workdir, 'fld_i_p.bin'), a)
+    nml = case_nml(ge, goe, fie, foe, ['p'], cbc, bc, {}, dims=(3, 1, 1), tiling={'ntiles(1)': 3})
+    run(workdir, nml, 3)
+    out, _ = read_field(os.path.join(workdir, 'fld_o_p.bin'), shape(goe))
+    ref = reference(np.tile(a, (3, 1, 1)), gte, goe, 'ccc', np.asarray(cbc['p']), np.asarray(bc['p'], float), periodic)
+    err = np.abs(out - ref).max()
+    assert err < 1e-12, f'tiling along a non-uniform direction: error {err}'
+    print('  tiling: 3 tiles along a non-uniform periodic direction, equal to the reference')
+    # input checks
+    nml = case_nml(ge, ge, fie, fie, ['p'], cbc, bc, {}, tiling={'tile_shifts(1:3,1)': [1, 0, 0]})
+    out = run(workdir, nml, 2, expect_fail=True)
+    assert 'directions with a uniform input grid' in out, out
+    fi, ft = setup(workdir, gi, gt, files)
+    checks = [({'ntiles(1:3)': [1, 1, 2]}, 'only possible along periodic directions'),
+              ({'ntiles(1:3)': [2, 1, 1], 'tile_inputs(3)': 'fld_a'}, 'beyond the number of tiles'),
+              ({'ntiles(1:3)': [2, 1, 1]}, 'domain lengths along x differ')]
+    for n in names:
+        write_field(os.path.join(workdir, f'fld_i_{n}.bin'), np.zeros(shape(gi)))
+    for tiling, msg in checks:
+        nml = case_nml(gi, gi, fi, fi, names, cbc, bc, {}, tiling=tiling)
+        out = run(workdir, nml, 2, expect_fail=True)
+        assert msg in out, out
+    write_field(os.path.join(workdir, 'fld_s_p.bin'), np.zeros(shape(gi)), np.float32)
+    gt2 = [tiled_grid(gi[0], 2), gi[1], gi[2]]
+    nml = case_nml(gi, gt2, fi, fi, ['p'], cbc, bc, {}, tiling={'ntiles(1:3)': [2, 1, 1],
+                   'tile_inputs(1:2)': ['fld_i', 'fld_s']})
+    out = run(workdir, nml, 2, expect_fail=True)
+    assert 'same precision' in out, out
+    print(f'  tiling: {len(checks) + 2} invalid inputs stop with a message')
+
+
 TESTS = {'identity': test_identity, 'linear': test_linear, 'layouts': test_layouts, 'precision': test_precision,
          'formats': test_formats, 'defaults': test_defaults, 'hdf5': test_hdf5, 'operations': test_operations,
-         'errors': test_input_errors}
+         'tiling': test_tiling, 'errors': test_input_errors}
 
 
 if __name__ == '__main__':
