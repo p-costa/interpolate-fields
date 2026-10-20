@@ -6,7 +6,7 @@ usage: run_tests.py [--exe EXE] [--workdir DIR] [--keep] [test ...]
 Each test writes CaNS-format grid and checkpoint files, runs the program with several MPI process grids,
 and checks the output: identity on the same grid, exactness for linear fields, process-grid independence,
 precision conversion, legacy and per-variable input, variables on edges and corners, a comparison with an
-independent NumPy implementation, HDF5 input and output (with h5py, if the program is built with HDF5;
+independent NumPy implementation, field operations (mean removal, offsets, frame change), HDF5 input and output (with h5py, if the program is built with HDF5;
 otherwise, the error message), and the input checks. The MPI launcher is taken from the environment
 variable MPIRUN (default: 'mpirun --oversubscribe').
 """
@@ -189,9 +189,10 @@ def cbc_bc_items(cbc, bc):
         yield name, (np.asarray(cbc[name]).T, np.asarray(bc[name], dtype=float).T)
 
 
-def case_nml(gi, go, files_i, files_o, variables, cbc, bc, locs, dims=(1, 0, 0), extra=None):
+def case_nml(gi, go, files_i, files_o, variables, cbc, bc, locs, dims=(1, 0, 0), extra=None, ops=None):
     """namelist of a case: gi, go: lists of Grid1d per direction; files_*: grid file names ('' = uniform);
-    cbc, bc: per variable, arrays (3, 2) of [direction][side]; locs: locations of non-default variables"""
+    cbc, bc: per variable, arrays (3, 2) of [direction][side]; locs: locations of non-default variables;
+    extra: other `&interp` entries; ops: `&operations` entries"""
     interp = {'dims(1:3)': list(dims), 'variables': variables, 'input_format': 'per-variable',
               'input_prefix': 'fld_i', 'output_prefix': 'fld_o'}
     interp.update(extra or {})
@@ -204,6 +205,8 @@ def case_nml(gi, go, files_i, files_o, variables, cbc, bc, locs, dims=(1, 0, 0),
             groups.append(('variable', {'name': name, 'is_staggered(1:3)': [c == 's' for c in locs[name]],
                                         'cbc(0:1,1:3)': np.asarray(cbc[name]).T,
                                         'bc(0:1,1:3)': np.asarray(bc[name], dtype=float).T}))
+    if ops:
+        groups.append(('operations', ops))
     return namelist(groups)
 
 
@@ -252,6 +255,24 @@ def reference(a, gi, go, loc, cbc, bc, periodic):
         shape = (-1,) + (1,)*(e.ndim - 1)
         out = np.moveaxis(e[m]*(1 - w.reshape(shape)) + e[m+1]*w.reshape(shape), 0, d)
     return out
+
+
+def weighted_mean(a, g, loc, periodic):
+    """volume-weighted mean, with the control volumes of the program (centres: the cells; faces: the spacings
+    between the centres, and the half cell at a bounded upper boundary)"""
+    w = []
+    for d in range(3):
+        n = g[d].n
+        xf, xc = g[d].with_ghosts(periodic[d])
+        if loc[d] == 's':
+            wd = xc[2:n+2] - xc[1:n+1]
+            if not periodic[d]:
+                wd[-1] = xf[n] - xc[n]
+        else:
+            wd = np.diff(xf[:n+1])
+        w.append(wd)
+    vol = w[0][:, None, None]*w[1][None, :, None]*w[2][None, None, :]
+    return (vol*a).sum()/vol.sum()
 
 
 def coordinates(g, loc, periodic):
@@ -657,8 +678,76 @@ def test_hdf5(workdir):
     print('  HDF5: a missing dataset and wrong dimensions stop with a message')
 
 
+def test_operations(workdir):
+    """mean removal, constant offsets and change of reference frame"""
+    for kind in ['channel', 'eigen']:
+        gi, go, files = grids(kind)
+        names = ['u', 'v', 'w', 'p']
+        if kind == 'eigen':
+            cbc, bc = walls_bc(names, [['P', 'P'], ['D', 'N'], ['N', 'D']])
+        else:
+            cbc, bc = CHANNEL_CBC, CHANNEL_BC
+        periodic = [cbc['p'][d][0] == 'P' for d in range(3)]
+        fi, fo = setup(workdir, gi, go, files)
+        data, ref = {}, {}
+        for i, n in enumerate(names):
+            data[n] = random_field(gi, DEFAULT_LOC[n], periodic, cbc[n], bc[n], 70 + i)
+            ref[n] = reference(data[n], gi, go, DEFAULT_LOC[n], np.asarray(cbc[n]), np.asarray(bc[n], float), periodic)
+
+        def interp(ops, big=0., dtype=np.float64, prec='double', dims=(2, 1, 2), nproc=4):
+            # p is shifted by `big`, with its Dirichlet values (the boundary conditions refer to the input)
+            bcs = {**bc, 'p': [[b + big*(c == 'D') for b, c in zip(bc['p'][d], cbc['p'][d])] for d in range(3)]}
+            for n in names:
+                write_field(os.path.join(workdir, f'fld_i_{n}.bin'), data[n] + (big if n == 'p' else 0.))
+            nml = case_nml(gi, go, fi, fo, names, cbc, bcs, {}, dims=dims, extra={'output_precision': prec}, ops=ops)
+            log = run(workdir, nml, nproc)
+            return {n: read_field(os.path.join(workdir, f'fld_o_{n}.bin'), shape(go), dtype)[0] for n in names}, log
+        # mean removal of all variables, with p shifted by 1e6 (as the drifting pressure of a long run)
+        out, log = interp({'is_remove_mean(1:4)': [True]*4}, big=1.e6)
+        for n in names:
+            m = weighted_mean(out[n], go, DEFAULT_LOC[n], periodic)
+            assert abs(m) < 1e-14, f'{kind} {n}: output mean {m}'
+            exact = ref[n] - weighted_mean(ref[n], go, DEFAULT_LOC[n], periodic)
+            err = np.abs(out[n] - exact).max()
+            assert err < (1e-9 if n == 'p' else 1e-13), f'{kind} {n}: differs from interp - mean by {err}'
+        assert 'p: mean of the input subtracted:' in log and 'p: residual mean of the output subtracted:' in log
+        # single-precision output: the field shifted by 1e6 gives the same field as without the shift
+        sp_big = interp({'is_remove_mean(4)': True}, big=1.e6, dtype=np.float32, prec='single')[0]['p']
+        sp_ref = interp({'is_remove_mean(4)': True}, dtype=np.float32, prec='single')[0]['p']
+        ulp = np.spacing(np.abs(sp_ref).max())
+        assert np.abs(sp_big - sp_ref).max() <= ulp, f'{kind}: single-precision output depends on the mean'
+        nsame = np.count_nonzero(sp_big == sp_ref)/sp_big.size
+        sp_nomean = interp({}, big=1.e6, dtype=np.float32, prec='single')[0]['p'].astype(np.float64) - 1.e6
+        err_nomean = np.abs(sp_nomean - ref['p']).max()
+        assert err_nomean > 1e-2
+        # offsets, also of a variable with Dirichlet conditions (u at the walls)
+        base = interp({})[0]
+        out = interp({'offset(1:4)': [3.7, 0., -1.25, 949381.]})[0]
+        for n, c in zip(names, [3.7, 0., -1.25, 949381.]):
+            err = np.abs(out[n] - (base[n] - c)).max()
+            assert err < 1e-13*max(1., abs(c)), f'{kind} {n}: offset {c} gives an error {err}'
+        # change of reference frame, combined with mean removal of p
+        uf = [0.3, -0.2, 0.1]
+        out, log = interp({'vel_frame(1:3)': uf, 'is_remove_mean(4)': True}, dims=(1, 3, 2), nproc=6)
+        for n, U in zip('uvw', uf):
+            assert np.array_equal(out[n], base[n] + U), f'{kind} {n}: frame velocity not added exactly'
+            assert f'{n}: frame velocity added:' in log
+        assert abs(weighted_mean(out['p'], go, 'ccc', periodic)) < 1e-14
+        print(f'  operations, {kind} grids: zero output mean (all locations, 1e6 shift of p), same single-precision '
+              f'p with and without the shift ({100*nsame:.1f}% bitwise, the rest within 1 ulp of the field; without mean removal: '
+              f'error {err_nomean:.2f}); offsets; frame velocity added exactly')
+    # input checks
+    for ops, msg in [({'is_remove_mean(4)': True, 'offset(4)': 1.}, 'are exclusive'),
+                     ({'is_remove_mean(5)': True}, 'beyond the number of `variables`')]:
+        nml = case_nml(gi, go, fi, fo, names, cbc, bc, {}, ops=ops)
+        out = run(workdir, nml, 2, expect_fail=True)
+        assert msg in out, out
+    print('  operations: conflicting or out-of-range options stop with a message')
+
+
 TESTS = {'identity': test_identity, 'linear': test_linear, 'layouts': test_layouts, 'precision': test_precision,
-         'formats': test_formats, 'defaults': test_defaults, 'hdf5': test_hdf5, 'errors': test_input_errors}
+         'formats': test_formats, 'defaults': test_defaults, 'hdf5': test_hdf5, 'operations': test_operations,
+         'errors': test_input_errors}
 
 
 if __name__ == '__main__':
