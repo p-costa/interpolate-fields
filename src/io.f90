@@ -8,7 +8,8 @@ module mod_io
   use mod_common, only: rp,sp,dp,i8,myid,ierr,abort_run
   implicit none
   private
-  public get_checkpoint_layout,read_fldinfo,read_block,write_field
+  public get_checkpoint_layout,read_fldinfo,read_block,write_field,CHUNK_BYTES
+  integer(i8), parameter :: CHUNK_BYTES = 64*2_i8**20 ! size of the buffer for single-precision output
 contains
   subroutine get_checkpoint_layout(fname,ng,is_legacy,iprec,nfields)
     !
@@ -238,7 +239,8 @@ contains
   subroutine write_field(fname,ng,lo,hi,iprec,p,time,istep)
     !
     ! writes a per-variable checkpoint file (the field, then the time and the time step) in single or double
-    ! precision (iprec = 4 or 8 bytes); each task writes its block p(lo(1):hi(1),lo(2):hi(2),lo(3):hi(3))
+    ! precision (iprec = 4 or 8 bytes); each task writes its block p(lo(1):hi(1),lo(2):hi(2),lo(3):hi(3)),
+    ! converted to single precision by chunks of planes (`CHUNK_BYTES`) if needed
     !
     implicit none
     character(len=*), intent(in) :: fname
@@ -254,7 +256,7 @@ contains
     type(MPI_FILE) :: fh
     integer(MPI_OFFSET_KIND) :: disp
     integer , dimension(3) :: n
-    integer :: nreals_myid
+    integer :: nreals_myid,nzc,nchunks,ic,k0,nk
     !
     n(:) = hi(:)-lo(:)+1
     if(iprec == 4) then
@@ -272,9 +274,21 @@ contains
     call MPI_FILE_SET_SIZE(fh,0_MPI_OFFSET_KIND,ierr)
     call MPI_FILE_SET_VIEW(fh,0_MPI_OFFSET_KIND,etype,type_glob,'native',MPI_INFO_NULL,ierr)
     if(iprec == 4) then
-      allocate(buf_sp(n(1),n(2),n(3)))
-      buf_sp(:,:,:) = real(p(:,:,:),sp)
-      call MPI_FILE_WRITE_ALL(fh,buf_sp,n(3),type_loc,MPI_STATUS_IGNORE,ierr)
+      !
+      ! convert and write in chunks of nzc planes, so that the single-precision copy stays small;
+      ! the file pointer advances within the view, and all tasks make the same number of
+      ! collective calls (with no data once their block is written)
+      !
+      nzc = int(max(1_i8,min(int(n(3),i8),CHUNK_BYTES/(4*int(n(1),i8)*n(2)))))
+      nchunks = (n(3)+nzc-1)/nzc
+      call MPI_ALLREDUCE(MPI_IN_PLACE,nchunks,1,MPI_INTEGER,MPI_MAX,MPI_COMM_WORLD,ierr)
+      allocate(buf_sp(n(1),n(2),nzc))
+      do ic=1,nchunks
+        k0 = lo(3) + (ic-1)*nzc
+        nk = max(0,min(nzc,hi(3)-k0+1))
+        if(nk > 0) buf_sp(:,:,1:nk) = real(p(:,:,k0:k0+nk-1),sp)
+        call MPI_FILE_WRITE_ALL(fh,buf_sp,nk,type_loc,MPI_STATUS_IGNORE,ierr)
+      end do
       deallocate(buf_sp)
     else
       call MPI_FILE_WRITE_ALL(fh,p     ,n(3),type_loc,MPI_STATUS_IGNORE,ierr)

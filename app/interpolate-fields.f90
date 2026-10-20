@@ -13,7 +13,7 @@
     use mod_grid  , only: grid_1d,init_grid,is_same_length
     use mod_bound , only: set_ghosts
     use mod_interp, only: get_weights,interp_fld
-    use mod_io    , only: get_checkpoint_layout,read_fldinfo,read_block,write_field
+    use mod_io    , only: get_checkpoint_layout,read_fldinfo,read_block,write_field,CHUNK_BYTES
     implicit none
     !
     ! brackets and weights of the output points of a block along one direction (see `get_weights`)
@@ -169,7 +169,7 @@
       ! the output block and the conversion buffer of `write_field`
       !
       mem = 8*size(fldo,kind=i8)
-      if(iprec_o == 4) mem = mem + 4*size(fldo,kind=i8)
+      if(iprec_o == 4) mem = mem + min(4*size(fldo,kind=i8),CHUNK_BYTES)
       mem = 8*size(fldi,kind=i8) + max(iprec_i*size(fldi,kind=i8),mem)
       mem_max = max(mem_max,mem)
       deallocate(fldi)
