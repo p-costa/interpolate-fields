@@ -31,7 +31,7 @@
     integer , dimension(3) :: dims,coords,n_o,lo_o,hi_o,lo_i,hi_i,own_lo,own_hi
     type(MPI_COMM) :: comm_cart
     real(rp), allocatable, dimension(:,:,:) :: fldi,fldo
-    real(rp) :: time,time_1,time_o,tol
+    real(rp) :: time,time_1,time_o,tol,pmin,pmax,pmean
     integer  :: istep,istep_1,istep_o
     integer(MPI_OFFSET_KIND) :: disp,disp_info,ntot_i
     integer :: iv,idir,iprec_i,iprec_o,nfields,mmax
@@ -153,8 +153,20 @@
       twi = MPI_WTIME()
       call read_block(trim(fname_i),trim(input_format),trim(var%name),disp,ng_i,iprec_i,is_periodic,lo_i,hi_i,fldi)
       tw(1) = tw(1) + (MPI_WTIME()-twi)
-      call print_stats(trim(var%name)//' (input) ',own_lo,own_hi,var%is_staggered,gi,lo_i,fldi)
+      call field_stats(own_lo,own_hi,var%is_staggered,gi,lo_i,fldi,pmin,pmax,pmean)
+      call print_stats(trim(var%name)//' (input) ',pmin,pmax,pmean)
       call set_ghosts(var%cbc,var%bc,var%is_staggered,gi,lo_i,hi_i,fldi)
+      !
+      ! field operations on the input: subtract the volume-weighted mean or a constant offset, in double
+      ! precision; the ghost points are shifted too, i.e. as the field with Dirichlet values shifted alike
+      !
+      if(var%is_remove_mean) then
+        fldi(:,:,:) = fldi(:,:,:) - pmean
+        if(myid == 0) print*, '  ', trim(var%name), ': mean of the input subtracted: ', pmean
+      else if(var%offset /= 0._rp) then
+        fldi(:,:,:) = fldi(:,:,:) - var%offset
+        if(myid == 0) print*, '  ', trim(var%name), ': offset subtracted: ', var%offset
+      end if
       !
       ! interpolate
       !
@@ -171,7 +183,21 @@
       mem = 8*size(fldi,kind=i8) + max(iprec_i*size(fldi,kind=i8),mem)
       mem_max = max(mem_max,mem)
       deallocate(fldi)
-      call print_stats(trim(var%name)//' (output)',lo_o,hi_o,var%is_staggered,go,lo_o,fldo)
+      !
+      ! field operations on the output: subtract the residual mean (on non-uniform grids, interpolation does
+      ! not preserve the mean exactly), and add a constant (the frame velocity, for u, v and w)
+      !
+      if(var%is_remove_mean) then
+        call field_stats(lo_o,hi_o,var%is_staggered,go,lo_o,fldo,pmin,pmax,pmean)
+        fldo(:,:,:) = fldo(:,:,:) - pmean
+        if(myid == 0) print*, '  ', trim(var%name), ': residual mean of the output subtracted: ', pmean
+      end if
+      if(var%added /= 0._rp) then
+        fldo(:,:,:) = fldo(:,:,:) + var%added
+        if(myid == 0) print*, '  ', trim(var%name), ': frame velocity added: ', var%added
+      end if
+      call field_stats(lo_o,hi_o,var%is_staggered,go,lo_o,fldo,pmin,pmax,pmean)
+      call print_stats(trim(var%name)//' (output)',pmin,pmax,pmean)
       !
       ! write the output
       !
@@ -230,27 +256,26 @@
       end if
     end subroutine print_grid
     !
-    subroutine print_stats(label,lo,hi,is_staggered,g,lo_p,p)
+    subroutine field_stats(lo,hi,is_staggered,g,lo_p,p,pmin,pmax,pmean)
       !
-      ! prints the global minimum, maximum and volume-weighted mean of p over the points lo:hi of each task,
-      ! with the cell widths dxf along cell-centred directions, and the spacings dxc between cell centres
-      ! along staggered directions
+      ! global minimum, maximum and volume-weighted mean of p, over the points lo:hi of each task (within
+      ! 1:n), with the widths of the control volumes of the variable's location (`wc` or `ws` of the grids)
       !
       implicit none
-      character(len=*), intent(in) :: label
       integer         , intent(in), dimension(3) :: lo,hi
       logical         , intent(in), dimension(3) :: is_staggered
       type(grid_1d)   , intent(in), dimension(3) :: g
       integer         , intent(in), dimension(3) :: lo_p
       real(rp)        , intent(in), dimension(lo_p(1):,lo_p(2):,lo_p(3):) :: p
+      real(rp)        , intent(out) :: pmin,pmax,pmean
       real(dp), allocatable, dimension(:) :: wx,wy,wz
-      real(dp) :: pmin,pmax,psum(2)
+      real(dp) :: psum(2)
       integer :: j,k
       !
       allocate(wx(lo(1):hi(1)),wy(lo(2):hi(2)),wz(lo(3):hi(3)))
-      wx(:) = merge(g(1)%dxc(lo(1):hi(1)),g(1)%dxf(lo(1):hi(1)),is_staggered(1))
-      wy(:) = merge(g(2)%dxc(lo(2):hi(2)),g(2)%dxf(lo(2):hi(2)),is_staggered(2))
-      wz(:) = merge(g(3)%dxc(lo(3):hi(3)),g(3)%dxf(lo(3):hi(3)),is_staggered(3))
+      wx(:) = merge(g(1)%ws(lo(1):hi(1)),g(1)%wc(lo(1):hi(1)),is_staggered(1))
+      wy(:) = merge(g(2)%ws(lo(2):hi(2)),g(2)%wc(lo(2):hi(2)),is_staggered(2))
+      wz(:) = merge(g(3)%ws(lo(3):hi(3)),g(3)%wc(lo(3):hi(3)),is_staggered(3))
       pmin =  huge(1._dp)
       pmax = -huge(1._dp)
       psum(:) = 0._dp
@@ -265,6 +290,13 @@
       call MPI_ALLREDUCE(MPI_IN_PLACE,pmin,1,MPI_DOUBLE_PRECISION,MPI_MIN,MPI_COMM_WORLD,ierr)
       call MPI_ALLREDUCE(MPI_IN_PLACE,pmax,1,MPI_DOUBLE_PRECISION,MPI_MAX,MPI_COMM_WORLD,ierr)
       call MPI_ALLREDUCE(MPI_IN_PLACE,psum,2,MPI_DOUBLE_PRECISION,MPI_SUM,MPI_COMM_WORLD,ierr)
-      if(myid == 0) print*, '  ', label, ': min = ', pmin, '| max = ', pmax, '| mean = ', psum(1)/psum(2)
+      pmean = psum(1)/psum(2)
+    end subroutine field_stats
+    !
+    subroutine print_stats(label,pmin,pmax,pmean)
+      implicit none
+      character(len=*), intent(in) :: label
+      real(rp)        , intent(in) :: pmin,pmax,pmean
+      if(myid == 0) print*, '  ', label, ': min = ', pmin, '| max = ', pmax, '| mean = ', pmean
     end subroutine print_stats
   end program interpolate_fields

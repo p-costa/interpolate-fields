@@ -3,7 +3,8 @@ module mod_grid
   ! one-dimensional grids, as in CaNS: xf(i) is the upper face of cell i (xf(0) = 0, xf(n) = l) and xc(i)
   ! its centre; the ghost points i = 0 and i = n+1 follow from periodicity, or from the mirror image about
   ! the boundary otherwise; dxf(i) = xf(i)-xf(i-1) are the cell widths and dxc(i) = xc(i+1)-xc(i) the
-  ! spacings between cell centres
+  ! spacings between cell centres; wc(i) and ws(i), i = 1:n, are the widths of the control volumes of the
+  ! centres (dxf) and of the faces (dxc; at a boundary, the half cell [xc(n),xf(n)]), for volume averages
   !
   use mpi_f08
   use mod_common , only: rp,sp,dp,i8,myid,ierr,abort_run
@@ -19,7 +20,7 @@ module mod_grid
     real(rp) :: l
     logical  :: is_periodic
     integer  :: iprec ! precision of the grid file, in bytes (0 for a uniform grid)
-    real(rp), allocatable, dimension(:) :: xc,xf,dxc,dxf
+    real(rp), allocatable, dimension(:) :: xc,xf,dxc,dxf,wc,ws
   end type grid_1d
 contains
   subroutine init_grid(n,l,fname,is_periodic,g)
@@ -45,7 +46,7 @@ contains
     if(n < 1) call abort_run('the number of grid cells `ng` must be prescribed and positive.')
     g%n = n
     g%is_periodic = is_periodic
-    allocate(g%xc(0:n+1),g%xf(0:n+1),g%dxc(0:n+1),g%dxf(0:n+1))
+    allocate(g%xc(0:n+1),g%xf(0:n+1),g%dxc(0:n+1),g%dxf(0:n+1),g%wc(n),g%ws(n))
     if(len_trim(fname) == 0) then
       if(l <= 0._rp) call abort_run('the domain length `l` must be prescribed and positive for a uniform grid.')
       g%iprec = 0
@@ -131,6 +132,9 @@ contains
     g%dxc(0:n)   = g%xc(1:n+1) - g%xc(0:n)
     g%dxc(n+1)   = g%dxc(n)
     if(is_periodic) g%dxc(n+1) = g%dxc(1)
+    g%wc(:) = g%dxf(1:n)
+    g%ws(:) = g%dxc(1:n)
+    if(.not.is_periodic) g%ws(n) = g%xf(n) - g%xc(n)
   end subroutine init_grid
   !
   logical function is_same_length(l1,l2,is_single)

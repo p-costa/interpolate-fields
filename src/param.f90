@@ -14,8 +14,9 @@ module mod_param
   integer, parameter :: LEN_NAME = 32, LEN_FILE = 256
   !
   ! a variable to process: name, location (staggered, i.e. on the cell faces, or cell-centred, per
-  ! direction), boundary conditions, and position in a legacy single-file checkpoint (u, v, w, p and
-  ! the scalars, in this order; 0 for other variables)
+  ! direction), boundary conditions, position in a legacy single-file checkpoint (u, v, w, p and
+  ! the scalars, in this order; 0 for other variables), and field operations: removal of the
+  ! volume-weighted mean or of a constant offset, and a constant added to the output (frame velocity)
   !
   type var_t
     character(len=LEN_NAME)            :: name
@@ -23,6 +24,8 @@ module mod_param
     character(len=1), dimension(0:1,3) :: cbc
     real(rp)        , dimension(0:1,3) :: bc
     integer                            :: ifield
+    logical                            :: is_remove_mean = .false.
+    real(rp)                           :: offset = 0._rp, added = 0._rp
   end type var_t
   !
   ! &interp
@@ -54,6 +57,9 @@ contains
     character(len=1), dimension(0:1,3,MAX_SCAL) :: cbcscal
     real(rp)        , dimension(0:1,3,MAX_SCAL) ::  bcscal
     type(var_t)     , dimension(MAX_VARS)       :: vars_nml
+    logical         , dimension(MAX_VARS)       :: is_remove_mean
+    real(rp)        , dimension(MAX_VARS)       :: offset
+    real(rp)        , dimension(3)              :: vel_frame
     integer :: iunit,istat,iv,jv,nvars,nvars_nml,ivel,iscal
     character(len=256) :: errmsg
     character(len=LEN_NAME) :: name
@@ -65,6 +71,7 @@ contains
     call read_nml_grid(iunit,fname,'grid_out',ng_o,l_o,grid_files_o)
     call read_nml_bc(iunit,fname,cbcvel,bcvel,cbcpre,bcpre,cbcscal,bcscal)
     call read_nml_variables(iunit,fname,nvars_nml,vars_nml)
+    call read_nml_operations(iunit,fname,is_remove_mean,offset,vel_frame)
     close(iunit)
     !
     ! &interp
@@ -150,6 +157,23 @@ contains
       if(trim(input_format) == 'legacy' .and. vars(iv)%ifield == 0) &
         call abort_run('variable `'//trim(name)//'` cannot be read from a legacy single-file checkpoint '// &
                        '(u, v, w, p and scalars only).')
+    end do
+    !
+    ! field operations, per variable in the order of `variables`
+    !
+    if(any(is_remove_mean(nvars+1:)) .or. any(offset(nvars+1:) /= 0._rp)) &
+      call abort_run('`is_remove_mean` or `offset` set beyond the number of `variables`.')
+    do iv=1,nvars
+      if(is_remove_mean(iv) .and. offset(iv) /= 0._rp) &
+        call abort_run('variable `'//trim(vars(iv)%name)//'`: `is_remove_mean` and `offset` are exclusive.')
+      vars(iv)%is_remove_mean = is_remove_mean(iv)
+      vars(iv)%offset         = offset(iv)
+      ivel = index('uvw',trim(vars(iv)%name))
+      if(ivel > 0 .and. len_trim(vars(iv)%name) == 1) vars(iv)%added = vel_frame(ivel)
+    end do
+    do ivel=1,3
+      if(vel_frame(ivel) /= 0._rp .and. .not.any(vars(:)%name == 'uvw'(ivel:ivel)) .and. myid == 0) &
+        print*, 'WARNING: `vel_frame(', ivel, ')` ignored (', 'uvw'(ivel:ivel), ' not in `variables`).'
     end do
     do jv=1,nvars_nml
       if(myid == 0 .and. .not.any(vars(:)%name == vars_nml(jv)%name)) &
@@ -324,6 +348,28 @@ contains
       vars_nml(nvars_nml)%ifield          = 0
     end do
   end subroutine read_nml_variables
+  !
+  subroutine read_nml_operations(iunit,fname,is_remove_mean,offset,vel_frame)
+    !
+    ! reads `&operations` (optional): field operations, per variable in the order of `variables`
+    !
+    implicit none
+    integer         , intent(in ) :: iunit
+    character(len=*), intent(in ) :: fname
+    logical         , intent(out), dimension(MAX_VARS) :: is_remove_mean
+    real(rp)        , intent(out), dimension(MAX_VARS) :: offset
+    real(rp)        , intent(out), dimension(3)        :: vel_frame
+    integer :: istat
+    character(len=256) :: errmsg
+    namelist /operations/ is_remove_mean,offset,vel_frame
+    !
+    is_remove_mean(:) = .false.
+    offset(:)         = 0._rp
+    vel_frame(:)      = 0._rp
+    rewind(iunit)
+    read(iunit,nml=operations,iostat=istat,iomsg=errmsg)
+    if(istat > 0) call abort_run('could not read namelist `&operations` from `'//fname//'`: '//trim(errmsg))
+  end subroutine read_nml_operations
   !
   logical function is_scalar_name(name,iscal)
     !
