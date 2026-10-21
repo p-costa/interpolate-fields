@@ -8,6 +8,9 @@ copyright = "Copyright 2021, Pedro Costa"
 auto-executables = true
 auto-tests = false
 auto-examples = false
-external-modules = "mpi_f08"
+external-modules = ["mpi_f08", "hdf5"]
 [install]
 library = false
+[preprocess]
+[preprocess.cpp]
+suffixes = ["f90"]

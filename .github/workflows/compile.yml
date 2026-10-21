@@ -9,7 +9,11 @@ jobs:
     
     steps:
     - uses: actions/checkout@v1
-    - name: Install OpenMPI and gfortran
-      run: sudo apt-get install gfortran libopenmpi-dev
+    - name: Install OpenMPI, gfortran, parallel HDF5, NumPy and h5py
+      run: sudo apt-get update && sudo apt-get install gfortran libopenmpi-dev libhdf5-openmpi-dev python3-numpy python3-h5py
     - name: Compile
-      run: cd src && make
+      run: make -j
+    - name: Test (debug build)
+      run: make clean && make -j FFLAGS_DEBUG=1 FFLAGS_OPT=0 && python3 tests/run_tests.py
+    - name: Test (debug build with HDF5)
+      run: make clean && make -j FFLAGS_DEBUG=1 FFLAGS_OPT=0 USE_HDF5=1 && python3 tests/run_tests.py

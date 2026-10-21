@@ -10,14 +10,18 @@ NAME := interpit
 TARGET := $(NAME)
 
 PWD=$(shell pwd)
-ROOTDIR := $(PWD)/..
-SRCDIR := $(ROOTDIR)/src
-APPDIR := $(ROOTDIR)/app
-EXEDIR := $(ROOTDIR)/exe
-INCDIR := $(SRCDIR)/include
-CONFIGDIR := $(SRCDIR)/configs
+ROOT_DIR := $(PWD)
+SRC_DIR := $(ROOT_DIR)/src
+APP_DIR := $(ROOT_DIR)/app
+EXE_DIR := $(ROOT_DIR)/exe
+CONFIG_DIR := $(SRC_DIR)/configs
 
-EXE := $(EXEDIR)/$(TARGET)
+DEFINES :=
+INCS :=
+LIBS :=
+
+EXE := $(EXE_DIR)/$(TARGET)
+EXE_TASKS := $(EXE_DIR)/task-checkpoints
 
 # Configuration settings
 FC := mpifort
@@ -25,14 +29,16 @@ FFLAGS :=
 AR := ar rcs
 LD := $(FC)
 RM := rm -f
-GD := ./.gen-deps.awk
+GD := $(SRC_DIR)/.gen-deps.awk
 
-include $(CONFIGDIR)/build.conf
-include $(INCDIR)/flags.mk
-include $(INCDIR)/compilers.mk
+# edit config/build.conf file desired
+include $(CONFIG_DIR)/build.conf
+include $(CONFIG_DIR)/flags.mk
+include $(CONFIG_DIR)/compilers.mk
+include $(CONFIG_DIR)/libs.mk
 
 # List of all source files
-SRCS := $(wildcard $(SRCDIR)/*.f90) $(wildcard $(APPDIR)/*.f90)
+SRCS := $(wildcard $(SRC_DIR)/*.f90) $(wildcard $(APP_DIR)/*.f90)
 TEST_SRCS := 
 
 # Define a map from each file name to its object file
@@ -41,6 +47,7 @@ $(foreach src, $(SRCS) $(TEST_SRCS), $(eval $(src) := $(obj)))
 
 # Create lists of the build artefacts in this project
 OBJS := $(addsuffix .o, $(SRCS))
+LIB_OBJS := $(addsuffix .o, $(wildcard $(SRC_DIR)/*.f90))
 DEPS := $(addsuffix .d, $(SRCS))
 TEST_OBJS := $(addsuffix .o, $(TEST_SRCS))
 TEST_DEPS := $(addsuffix .d, $(TEST_SRCS))
@@ -50,7 +57,7 @@ TEST_EXE := $(patsubst %.f90, %.exe, $(TEST_SRCS))
 # Declare all public targets
 .PHONY: all clean
 #all: $(LIB) $(TEST_EXE) $(EXE)
-all: $(TEST_EXE) $(EXE)
+all: $(TEST_EXE) $(EXE) $(EXE_TASKS)
 
 # Create the static library from the object files
 #$(LIB): #$(OBJS)
@@ -60,13 +67,17 @@ all: $(TEST_EXE) $(EXE)
 $(TEST_EXE): %.exe: %.f90.o $(LIB)
 	$(LD) -o $@ $^
 
-$(EXE): $(OBJS)
-	mkdir -p $(EXEDIR)/data
-	$(FC) $(FFLAGS) $^ -o $(EXE)
+$(EXE): $(LIB_OBJS) $(APP_DIR)/interpolate-fields.f90.o
+	mkdir -p $(EXE_DIR)/data
+	$(FC) $(FFLAGS) $^ $(LIBS) -o $@
+
+$(EXE_TASKS): $(LIB_OBJS) $(APP_DIR)/task-checkpoints.f90.o
+	mkdir -p $(EXE_DIR)
+	$(FC) $(FFLAGS) $^ $(LIBS) -o $@
 
 # Create object files from Fortran source
 $(OBJS) $(TEST_OBJS): %.o: % | %.d
-	$(FC) $(FFLAGS) -c -o $@ $<
+	$(FC) $(FFLAGS) -cpp $(DEFINES) $(INCS) -c -o $@ $<
 
 # Process the Fortran source for module dependencies
 $(DEPS) $(TEST_DEPS): %.d: %
@@ -78,4 +89,4 @@ $(foreach dep, $(OBJS) $(TEST_OBJS), $(eval $(dep): $($(dep))))
 
 # Cleanup, filter to avoid removing source code by accident
 clean:
-	$(RM) $(filter %.o, $(OBJS) $(TEST_OBJS)) $(filter %.d, $(DEPS) $(TEST_DEPS)) $(filter %.exe, $(TEST_EXE)) $(wildcard *.mod) $(EXE)
+	$(RM) $(filter %.o, $(OBJS) $(TEST_OBJS)) $(filter %.d, $(DEPS) $(TEST_DEPS)) $(filter %.exe, $(TEST_EXE)) $(wildcard *.mod) $(EXE) $(EXE_TASKS)

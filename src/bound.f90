@@ -1,224 +1,98 @@
 module mod_bound
-  use mpi_f08
-  use mod_common, only: rp,MPI_REAL_RP,ierr
+  use mod_common, only: rp
+  use mod_grid  , only: grid_1d
+  implicit none
   private
-  public makehalo,updthalo,set_bc
+  public set_ghosts
 contains
-  subroutine makehalo(idir,nh,n,halo)
-    implicit none
-    integer           , intent(in ) :: idir,nh
-    integer           , intent(in ), dimension(3) :: n
-    type(MPI_DATATYPE), intent(out) :: halo
-    integer, dimension(3) :: nn
-    nn(:) = n(:) + 2*nh
-    select case(idir)
-    case(1)
-      call MPI_TYPE_VECTOR(nn(2)*nn(3),nh            ,nn(1)            ,MPI_REAL_RP,halo,ierr)
-    case(2)
-      call MPI_TYPE_VECTOR(      nn(3),nh*nn(1)      ,nn(1)*nn(2)      ,MPI_REAL_RP,halo,ierr)
-    case(3)
-      call MPI_TYPE_VECTOR(          1,nh*nn(1)*nn(2),nn(1)*nn(2)*nn(3),MPI_REAL_RP,halo,ierr)
-    end select
-    call MPI_TYPE_COMMIT(halo,ierr)
-  end subroutine makehalo
-  !
-  subroutine updthalo(nh,halo,nb,idir,p)
-    implicit none
-    integer           , intent(in) :: nh ! number of ghost points
-    type(MPI_DATATYPE), intent(in) :: halo
-    integer           , intent(in), dimension(0:1) :: nb
-    integer           , intent(in) :: idir
-    real(rp)          , dimension(1-nh:,1-nh:,1-nh:), intent(inout) :: p
-    integer           , dimension(3) :: lo,hi
+  subroutine set_ghosts(cbc,bc,is_staggered,g,lo,hi,p)
     !
-    !  this subroutine updates the halo that store info
-    !  from the neighboring computational sub-domain
+    ! imposes the boundary conditions along the non-periodic directions on a block p(lo(1):hi(1),...) of a
+    ! field, indexed as the global grid, as in CaNS (`set_bc`): a cell-centred variable gets the ghost
+    ! points i = 0 and i = n+1; a staggered variable gets the points on the boundary faces, i = 0 and
+    ! i = n (where Dirichlet conditions prescribe the value, and Neumann conditions a one-sided difference)
     !
-    lo(:) = lbound(p)+nh
-    hi(:) = ubound(p)-nh
-    select case(idir)
-    case(1) ! x direction
-      call MPI_SENDRECV(p(lo(1)     ,lo(2)-nh,lo(3)-nh),1,halo,nb(0),0, &
-                        p(hi(1)+1   ,lo(2)-nh,lo(3)-nh),1,halo,nb(1),0, &
-                        MPI_COMM_WORLD,MPI_STATUS_IGNORE,ierr)
-      call MPI_SENDRECV(p(hi(1)-nh+1,lo(2)-nh,lo(3)-nh),1,halo,nb(1),0, &
-                        p(lo(1)-nh  ,lo(2)-nh,lo(3)-nh),1,halo,nb(0),0, &
-                        MPI_COMM_WORLD,MPI_STATUS_IGNORE,ierr)
-    case(2) ! y direction
-      call MPI_SENDRECV(p(lo(1)-nh,lo(2)     ,lo(3)-nh),1,halo,nb(0),0, &
-                        p(lo(1)-nh,hi(2)+1   ,lo(3)-nh),1,halo,nb(1),0, &
-                        MPI_COMM_WORLD,MPI_STATUS_IGNORE,ierr)
-      call MPI_SENDRECV(p(lo(1)-nh,hi(2)-nh+1,lo(3)-nh),1,halo,nb(1),0, &
-                        p(lo(1)-nh,lo(2)-nh  ,lo(3)-nh),1,halo,nb(0),0, &
-                        MPI_COMM_WORLD,MPI_STATUS_IGNORE,ierr)
-    case(3) ! z direction
-      call MPI_SENDRECV(p(lo(1)-nh,lo(2)-nh,lo(3)     ),1,halo,nb(0),0, &
-                        p(lo(1)-nh,lo(2)-nh,hi(3)+1   ),1,halo,nb(1),0, &
-                        MPI_COMM_WORLD,MPI_STATUS_IGNORE,ierr)
-      call MPI_SENDRECV(p(lo(1)-nh,lo(2)-nh,hi(3)-nh+1),1,halo,nb(1),0, &
-                        p(lo(1)-nh,lo(2)-nh,lo(3)-nh  ),1,halo,nb(0),0, &
-                        MPI_COMM_WORLD,MPI_STATUS_IGNORE,ierr)
-    end select
-  end subroutine updthalo
-  !
-  subroutine set_bc(ctype,ibound,idir,nh,centered,rvalue,dr,p)
+    ! the directions are processed in order, each over the whole block, so that the edges and corners
+    ! are set consistently by the last direction
+    !
     implicit none
-    character(len=1), intent(in) :: ctype
-    integer , intent(in) :: ibound,idir,nh
-    logical , intent(in) :: centered
-    real(rp), intent(in) :: rvalue,dr
-    real(rp), intent(inout), dimension(1-nh:,1-nh:,1-nh:) :: p
-    real(rp) :: factor,sgn
-    integer  :: n,dh
+    character(len=1), intent(in), dimension(0:1,3) :: cbc
+    real(rp)        , intent(in), dimension(0:1,3) :: bc
+    logical         , intent(in), dimension(3)     :: is_staggered
+    type(grid_1d)   , intent(in), dimension(3)     :: g
+    integer         , intent(in), dimension(3)     :: lo,hi
+    real(rp), intent(inout), dimension(lo(1):,lo(2):,lo(3):) :: p
+    integer :: idir,n
     !
-    n = size(p,idir) - 2*nh
-    factor = rvalue
-    if(ctype == 'D'.and.centered) then
-      factor = 2.*factor
-      sgn    = -1.
-    end if
-    if(ctype == 'N') then
-      if(     ibound == 0) then
-        factor = -dr*factor ! n.b.: only valid for nh /= 1 or factor /= 0
-      else if(ibound == 1) then
-        factor =  dr*factor ! n.b.: only valid for nh /= 1 or factor /= 0
+    do idir=1,3
+      if(g(idir)%is_periodic) cycle
+      n = g(idir)%n
+      if(.not.is_staggered(idir)) then
+        if(lo(idir) <= 0) then
+          select case(cbc(0,idir))
+          case('D')
+            call set_plane(idir,lo,0  ,1  ,2*bc(0,idir)               ,-1._rp,p)
+          case('N')
+            call set_plane(idir,lo,0  ,1  ,-g(idir)%dxc(0)*bc(0,idir) , 1._rp,p)
+          end select
+        end if
+        if(hi(idir) >= n+1) then
+          select case(cbc(1,idir))
+          case('D')
+            call set_plane(idir,lo,n+1,n  ,2*bc(1,idir)               ,-1._rp,p)
+          case('N')
+            call set_plane(idir,lo,n+1,n  , g(idir)%dxc(n)*bc(1,idir) , 1._rp,p)
+          end select
+        end if
+      else
+        if(lo(idir) <= 0) then
+          select case(cbc(0,idir))
+          case('D')
+            call set_plane(idir,lo,0  ,0  ,bc(0,idir)                 , 0._rp,p)
+          case('N')
+            call set_plane(idir,lo,0  ,1  ,-g(idir)%dxf(0)*bc(0,idir) , 1._rp,p)
+          end select
+        end if
+        if(hi(idir) >= n) then
+          select case(cbc(1,idir))
+          case('D')
+            call set_plane(idir,lo,n  ,n  ,bc(1,idir)                 , 0._rp,p)
+          case('N')
+            call set_plane(idir,lo,n  ,n-1, g(idir)%dxf(n)*bc(1,idir) , 1._rp,p)
+          end select
+        end if
       end if
-      sgn    = 1.
-    end if
+    end do
+  end subroutine set_ghosts
+  !
+  subroutine set_plane(idir,lo,ig,isrc,factor,sgn,p)
     !
-    dh = nh-1
-    select case(ctype)
-    case('P')
+    ! sets plane ig along direction idir: p(ig) = factor + sgn*p(isrc), or p(ig) = factor if sgn = 0
+    !
+    implicit none
+    integer , intent(in) :: idir
+    integer , intent(in), dimension(3) :: lo
+    integer , intent(in) :: ig,isrc
+    real(rp), intent(in) :: factor,sgn
+    real(rp), intent(inout), dimension(lo(1):,lo(2):,lo(3):) :: p
+    if(sgn == 0._rp) then
       select case(idir)
       case(1)
-        !$OMP WORKSHARE
-        p(0  :  0-dh,:,:) = p(n:n-dh,:,:)
-        p(n+1:n+1+dh,:,:) = p(1:1+dh,:,:)
-        !$OMP END WORKSHARE
+        p(ig,:,:) = factor
       case(2)
-        !$OMP WORKSHARE
-        p(:,0  :  0-dh,:) = p(:,n:n-dh,:)
-        p(:,n+1:n+1+dh,:) = p(:,1:1+dh,:)
-        !$OMP END WORKSHARE
+        p(:,ig,:) = factor
       case(3)
-        !$OMP WORKSHARE
-        p(:,:,0  :  0-dh) = p(:,:,n:n-dh)
-        p(:,:,n+1:n+1+dh) = p(:,:,1:1+dh)
-        !$OMP END WORKSHARE
+        p(:,:,ig) = factor
       end select
-    case('D','N')
-      if(centered) then
-        select case(idir)
-        case(1)
-          if     (ibound == 0) then
-            !$OMP WORKSHARE
-            p(0  :  0-dh,:,:) = factor+sgn*p(1:1+dh,:,:)
-            !$OMP END WORKSHARE
-          else if(ibound == 1) then
-            !$OMP WORKSHARE
-            p(n+1:n+1+dh,:,:) = factor+sgn*p(n:n-dh,:,:)
-            !$OMP END WORKSHARE
-          end if
-        case(2)
-          if     (ibound == 0) then
-            !$OMP WORKSHARE
-            p(:,0  :  0-dh,:) = factor+sgn*p(:,1:1+dh,:)
-            !$OMP END WORKSHARE
-          else if(ibound == 1) then
-            !$OMP WORKSHARE
-            p(:,n+1:n+1+dh,:) = factor+sgn*p(:,n:n-dh,:)
-            !$OMP END WORKSHARE
-          end if
-        case(3)
-          if     (ibound == 0) then
-            !$OMP WORKSHARE
-            p(:,:,0  :  0-dh) = factor+sgn*p(:,:,1:1+dh)
-            !$OMP END WORKSHARE
-          else if(ibound == 1) then
-            !$OMP WORKSHARE
-            p(:,:,n+1:n+1+dh) = factor+sgn*p(:,:,n:n-dh)
-            !$OMP END WORKSHARE
-          end if
-        end select
-      else if(.not.centered.and.ctype == 'D') then
-        select case(idir)
-        case(1)
-          if     (ibound == 0) then
-            !$OMP WORKSHARE
-            p(0:0-dh,:,:) = factor
-            !$OMP END WORKSHARE
-          else if(ibound == 1) then
-            !$OMP WORKSHARE
-            p(n+1   ,:,:) = p(n-1,:,:) ! unused
-            p(n:n+dh,:,:) = factor
-            !$OMP END WORKSHARE
-          end if
-        case(2)
-          if     (ibound == 0) then
-            !$OMP WORKSHARE
-            p(:,0:0-dh,:) = factor
-            !$OMP END WORKSHARE
-          else if(ibound == 1) then
-            !$OMP WORKSHARE
-            p(:,n+1   ,:) = p(:,n-1,:) ! unused
-            p(:,n:n+dh,:) = factor
-            !$OMP END WORKSHARE
-          end if
-        case(3)
-          if     (ibound == 0) then
-            !$OMP WORKSHARE
-            p(:,:,0:0-dh) = factor
-            !$OMP END WORKSHARE
-          else if(ibound == 1) then
-            !$OMP WORKSHARE
-            p(:,:,n+1   ) = p(:,:,n-1) ! unused
-            p(:,:,n:n+dh) = factor
-            !$OMP END WORKSHARE
-          end if
-        end select
-      else if(.not.centered.and.ctype == 'N') then
-        select case(idir)
-        case(1)
-          if     (ibound == 0) then
-            !$OMP WORKSHARE
-            !p(0,:,:) = 1./3.*(-2.*factor+4.*p(1  ,:,:)-p(2  ,:,:))
-            p(0:0-dh,:,:) = 1.*factor + p(1  :  1+dh,:,:)
-            !$OMP END WORKSHARE
-          else if(ibound == 1) then
-            !$OMP WORKSHARE
-            !p(n,:,:) = 1./3.*(-2.*factor+4.*p(n-1,:,:)-p(n-2,:,:))
-            p(n+1,:,:) = p(n,:,:) ! unused
-            p(n:n+dh,:,:) = 1.*factor + p(n-1:n-1-dh,:,:)
-            !$OMP END WORKSHARE
-          end if
-        case(2)
-          if     (ibound == 0) then
-            !$OMP WORKSHARE
-            !p(:,0  ,:) = 1./3.*(-2.*factor+4.*p(:,1,:)-p(:,2  ,:))
-            p(:,0:0-dh,:) = 1.*factor + p(:,1  :  1+dh,:)
-            !$OMP END WORKSHARE
-          else if(ibound == 1) then
-            !$OMP WORKSHARE
-            !p(:,n,:) = 1./3.*(-2.*factor+4.*p(:,n-1,:)-p(:,n-2,:))
-            p(:,n+1,:) = p(:,n,:) ! unused
-            p(:,n:n+dh,:) = 1.*factor + p(:,n-1:n-1-dh,:)
-            !$OMP END WORKSHARE
-          end if
-        case(3)
-          if     (ibound == 0) then
-            !$OMP WORKSHARE
-            !p(:,:,0) = 1./3.*(-2.*factor+4.*p(:,:,1  )-p(:,:,2  ))
-            p(:,:,0:0-dh) = 1.*factor + p(:,:,1  :  1+dh)
-            !$OMP END WORKSHARE
-          else if(ibound == 1) then
-            !$OMP WORKSHARE
-            !p(:,:,n) = 1./3.*(-2.*factor+4.*p(:,:,n-1)-p(:,:,n-2))
-            p(:,:,n+1) = p(:,:,n) ! unused
-            p(:,:,n:n+dh) = 1.*factor + p(:,:,n-1:n-1-dh)
-            !$OMP END WORKSHARE
-          end if
-        end select
-      end if
-    end select
-  end subroutine set_bc
+    else
+      select case(idir)
+      case(1)
+        p(ig,:,:) = factor + sgn*p(isrc,:,:)
+      case(2)
+        p(:,ig,:) = factor + sgn*p(:,isrc,:)
+      case(3)
+        p(:,:,ig) = factor + sgn*p(:,:,isrc)
+      end select
+    end if
+  end subroutine set_plane
 end module mod_bound
