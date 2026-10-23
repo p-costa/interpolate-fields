@@ -82,14 +82,7 @@ Periodic tiling (optional): the input domain is made of `ntiles(1) x ntiles(2) x
 | `tile_inputs(:)` | `input_prefix` (or `input_file`) | input of each tile, x fastest (tile `(tx,ty,tz)`, from 0, is number `1 + tx + ntiles(1)*(ty + ntiles(2)*tz)`): the prefix of its files, or its legacy file; all on the same grid and in the same precision |
 | `tile_shifts(1:3,:)` | `0` | periodic shift of each tile, in input cells: point `i` of the tile holds point `i + shift` of its checkpoint (as `numpy.roll(f, -shift)`); whole cells keep the staggering, and require a uniform input grid along that direction |
 
-With `is_remove_mean`, the mean of each tile is removed separately before the interpolation (different snapshots have different pressure means, which would leave jumps between the tiles). The time and time step of the output are those of the first tile. For example, a box twice as long and wide from four snapshots:
-```fortran
-&tiling
-ntiles(1:3) = 2, 2, 1
-tile_inputs(1:4) = 'data/fld_0001', 'data/fld_0002', 'data/fld_0003', 'data/fld_0004'
-tile_shifts(1:3,1:4) = 0,0,0,  317,120,0,  45,333,0,  210,64,0
-/
-```
+With `is_remove_mean`, the mean of each tile is removed separately before the interpolation (different snapshots have different pressure means, which would leave jumps between the tiles). The time and time step of the output are those of the first tile. See the example [`channel-tiling`](examples/channel-tiling/interp.nml).
 
 ### Boundary conditions and ghost points
 As in CaNS (`set_bc`): along a periodic direction, the field wraps around; along a bounded direction, a cell-centred variable gets ghost points mirrored about the boundary (Dirichlet: `f(0) = 2*bc - f(1)`; Neumann: `f(0) = f(1) - dzc(0)*bc`), and a staggered variable gets its values on the boundary faces (Dirichlet: `f(0) = bc` and `f(n) = bc`; Neumann: `f(0) = f(1) - dzf(0)*bc` and `f(n) = f(n-1) + dzf(n)*bc`). Fields that are linear in space and consistent with these conditions are therefore interpolated exactly, also near the boundaries. Immersed boundaries get no special treatment: solid regions are interpolated like the fluid. The boundary conditions only serve to set the ghost points for the interpolation, with one value per boundary: for spatially varying Dirichlet values (e.g., an inflow profile, whose boundary values are not stored in the checkpoints), a Neumann condition with zero gradient (`'N'`, `0.`) gives the closest ghost points, and the run restarted from the output imposes its own conditions.
@@ -98,62 +91,16 @@ As in CaNS (`set_bc`): along a periodic direction, the field wraps around; along
 As written and read by CaNS and CaNS-EIGEN (`io_field_hdf5`): the field in dataset `fields/<var>` (dimensions `ng`, x fastest, in single or double precision), the time and the time step in `meta/time` and `meta/istep`, and the coordinates of the variable's location, ghost points included, in `grid/x`, `grid/y` and `grid/z`; with `is_compress_output = T`, the field is stored in chunks of at most 2 MiB aligned with the blocks of the tasks, gzip-compressed (level 4, with the shuffle filter). The grid files `grid_<dir>.h5` hold the cell centres in `rc` and the cell faces in `rf`. All tasks read and write their blocks collectively, as hyperslabs.
 
 ## Examples
+The folder [`examples`](examples) has input files for typical cases, each described at the top of the file: copy the `interp.nml` of a case into the run directory, and adapt the file names, grid sizes and process grid.
 
-### CaNS turbulent channel (uniform x and y, non-uniform z)
-Interpolation of a channel at Re_tau = 5200 onto a finer grid along y and z, from a single-precision legacy checkpoint into single-precision per-variable files, to be used as an initial condition:
-```fortran
-&interp
-dims(1:3) = 1, 4, 30
-input_format = 'legacy', input_file = 'data/fld_i.bin'
-output_prefix = 'data/fld_o', output_precision = 'single'
-is_reset_time = T
-/
-&grid_in
-ng(1:3) = 3456, 2970, 976, l(1:3) = 6.283185307179586, 3.141592653589793, 2.
-grid_files(1:3) = '', '', 'data/grid_i.bin'
-/
-&grid_out
-ng(1:3) = 3456, 3840, 1648, l(1:3) = 6.283185307179586, 3.141592653589793, 2.
-grid_files(1:3) = '', '', 'data/grid_o.bin'
-/
-&bc
-cbcvel(0:1,1:3,1) = 'P','P',  'P','P',  'D','D'
-cbcvel(0:1,1:3,2) = 'P','P',  'P','P',  'D','D'
-cbcvel(0:1,1:3,3) = 'P','P',  'P','P',  'D','D'
-cbcpre(0:1,1:3)   = 'P','P',  'P','P',  'N','N'
-bcvel(0:1,1:3,1)  = 0.,0.,  0.,0.,  -1.,-1.
-/
-&operations
-is_remove_mean(4) = T
-/
-```
-The wall velocity `bcvel(:,3,1) = -1` is that of a run in a reference frame moving with the bulk velocity. The mean of the pressure is removed, so that its fluctuations are resolved in single precision.
+| example | case |
+|---|---|
+| [`channel-refine`](examples/channel-refine/interp.nml) | CaNS turbulent channel (uniform x and y, non-uniform z) onto a finer grid, from a single-precision legacy checkpoint, as an initial condition in a moving reference frame |
+| [`duct`](examples/duct/interp.nml) | CaNS-EIGEN periodic duct (non-uniform along all directions) with a passive scalar |
+| [`duct-hdf5`](examples/duct-hdf5/interp.nml) | the same, with HDF5 input and compressed HDF5 output |
+| [`channel-tiling`](examples/channel-tiling/interp.nml) | CaNS turbulent channel: a box twice as long and wide, from four snapshots (periodic tiling) |
 
-### CaNS-EIGEN periodic duct (non-uniform along all directions)
-Interpolation of all fields, including a passive scalar, of a duct (periodic along x, walls along y and z), with the grid files written by CaNS-EIGEN for the input and output runs:
-```fortran
-&interp
-variables = 'u', 'v', 'w', 'p', 's_001'
-input_prefix = 'input/data/fld', output_prefix = 'output/data/fld'
-/
-&grid_in
-ng(1:3) = 256, 192, 192
-grid_files(1:3) = 'input/data/grid_x.bin', 'input/data/grid_y.bin', 'input/data/grid_z.bin'
-/
-&grid_out
-ng(1:3) = 384, 288, 288
-grid_files(1:3) = 'output/data/grid_x.bin', 'output/data/grid_y.bin', 'output/data/grid_z.bin'
-/
-&bc
-cbcvel(0:1,1:3,1) = 'P','P',  'D','D',  'D','D'
-cbcvel(0:1,1:3,2) = 'P','P',  'D','D',  'D','D'
-cbcvel(0:1,1:3,3) = 'P','P',  'D','D',  'D','D'
-cbcpre(0:1,1:3)   = 'P','P',  'N','N',  'N','N'
-cbcscal(0:1,1:3,1) = 'P','P',  'N','N',  'D','D'
-bcscal(0:1,1:3,1)  = 0.,0.,  0.,0.,  0.,1.
-/
-```
-The output grid files can be generated by running CaNS-EIGEN with the output grid for zero time steps (`nstep = 0`); with `output_prefix = 'output/data/fld'`, the output files are those that CaNS-EIGEN reads when restarting in `output/`. For runs with `io_backend = 'hdf5'`, set `input_format = 'hdf5'` and `output_format = 'hdf5'` (optionally with `is_compress_output = T`), and use the `grid_<dir>.h5` grid files (or the `.bin` ones, which CaNS-EIGEN writes too). A variable on the cell edges, e.g. the z vorticity computed in post-processing, can be added to `variables` with:
+A variable on the cell edges, e.g. the z vorticity computed in post-processing, can be added to `variables` with a group:
 ```fortran
 &variable
 name = 'omz', is_staggered(1:3) = T, T, F

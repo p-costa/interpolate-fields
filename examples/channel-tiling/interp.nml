@@ -1,0 +1,29 @@
+! CaNS turbulent channel: a box twice as long and wide at the same resolution, made of four
+! snapshots of a run (rotating checkpoints fld_0001 to fld_0004) in 2 x 2 tiles, each shifted by
+! a whole number of cells along x and y, which avoids the artificial periodicity of identical
+! copies; the mean pressure of each snapshot is removed separately
+&interp
+input_prefix = 'data/fld_0001', output_prefix = 'data/fld_tiled'
+/
+&grid_in
+ng(1:3) = 192, 128, 96, l(1:3) = 6.283185307179586, 3.141592653589793, 2.
+grid_files(1:3) = '', '', 'data/grid.bin'
+/
+&grid_out
+ng(1:3) = 384, 256, 96, l(1:3) = 12.566370614359172, 6.283185307179586, 2.
+grid_files(1:3) = '', '', 'data/grid.bin'
+/
+&bc
+cbcvel(0:1,1:3,1) = 'P','P',  'P','P',  'D','D'
+cbcvel(0:1,1:3,2) = 'P','P',  'P','P',  'D','D'
+cbcvel(0:1,1:3,3) = 'P','P',  'P','P',  'D','D'
+cbcpre(0:1,1:3)   = 'P','P',  'P','P',  'N','N'
+/
+&operations
+is_remove_mean(4) = T
+/
+&tiling
+ntiles(1:3) = 2, 2, 1
+tile_inputs(1:4) = 'data/fld_0001', 'data/fld_0002', 'data/fld_0003', 'data/fld_0004'
+tile_shifts(1:3,1:4) = 0,0,0,  97,40,0,  15,111,0,  70,21,0
+/

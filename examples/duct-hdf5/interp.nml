@@ -1,0 +1,23 @@
+! as in ../duct, for runs with io_backend = 'hdf5': HDF5 input and compressed HDF5 output, with
+! the HDF5 grid files (requires a build with HDF5)
+&interp
+variables = 'u', 'v', 'w', 'p', 's_001'
+input_format = 'hdf5', input_prefix = 'input/data/fld'
+output_format = 'hdf5', output_prefix = 'output/data/fld', is_compress_output = T
+/
+&grid_in
+ng(1:3) = 256, 192, 192
+grid_files(1:3) = 'input/data/grid_x.h5', 'input/data/grid_y.h5', 'input/data/grid_z.h5'
+/
+&grid_out
+ng(1:3) = 384, 288, 288
+grid_files(1:3) = 'output/data/grid_x.h5', 'output/data/grid_y.h5', 'output/data/grid_z.h5'
+/
+&bc
+cbcvel(0:1,1:3,1) = 'P','P',  'D','D',  'D','D'
+cbcvel(0:1,1:3,2) = 'P','P',  'D','D',  'D','D'
+cbcvel(0:1,1:3,3) = 'P','P',  'D','D',  'D','D'
+cbcpre(0:1,1:3)   = 'P','P',  'N','N',  'N','N'
+cbcscal(0:1,1:3,1) = 'P','P',  'N','N',  'D','D'
+bcscal(0:1,1:3,1)  = 0.,0.,  0.,0.,  0.,1.
+/
